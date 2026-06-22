@@ -549,16 +549,14 @@ fn schema_for_values(
         child_segments.push(key.clone());
 
         let label = if types.contains(&"array") {
-            if types.iter().all(|t| matches!(*t, "array" | "null")) {
-                array_label(outdir, &child_segments, &values)?
-            } else {
-                types
-                    .iter()
-                    .filter(|t| **t != "null")
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join("|")
+            let mut labels = BTreeSet::new();
+            labels.insert(array_label(outdir, &child_segments, &values)?);
+            for value_type in types {
+                if !matches!(value_type, "array" | "null") {
+                    labels.insert(value_type.to_string());
+                }
             }
+            union_member_labels(labels)
         } else if types.contains(&"object") {
             if types.iter().all(|t| matches!(*t, "object" | "null")) {
                 format!("{}.json", reference_path(outdir, &child_segments))
@@ -861,6 +859,21 @@ mod tests {
         assert_eq!(schema["mixed"], "array(refs/root/mixed.json|string)");
         assert_eq!(schema["matrix"], "array(array(refs/root/matrix.json))");
         assert_eq!(schema["capabilities"], "array(array(string))");
+    }
+
+    #[test]
+    fn mixed_array_and_scalar_fields_preserve_the_array_member_label() {
+        let schema = schema_for_values(
+            Path::new("refs"),
+            &["root".to_string()],
+            &[
+                object(json!({"content": [{"type": "text"}]})),
+                object(json!({"content": "<command-message>example</command-message>"})),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(schema["content"], "array(refs/root/content.json)|string");
     }
 
     #[test]

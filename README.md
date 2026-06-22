@@ -46,6 +46,7 @@ CREATE TABLE array_index_refs (
 - Primitive labels: `string`, `number`, `boolean`, `null`, optional suffix `?`, union via `|`.
 - Object fields use a plain reference such as `<path>.json`; nullable or missing object fields do not add `?` or `|null` to that reference.
 - Every array field uses `array(...)`: primitive arrays use labels such as `array(string)`, object arrays use `array(<path>.json)`, nested arrays add another wrapper, and mixed object/string items use `array(<path>.json|string)`.
+- A field observed both as an array and as a scalar preserves both shapes, for example `array(<path>.json)|string`.
 - Object arrays use one `<array_path>.json` when homogeneous. Heterogeneous object arrays use `<array_path>.json` containing `{ "$refs_mut": "<array_path>/" }`, with distinct schemas stored as `<array_path>/<index_path>.json`.
 - `array_index_refs.array_index_path` is a JSON array of every enclosing array position; `[1,0]` identifies the first nested item inside the second outer item.
 - JSONL input ignores raw NUL padding only at the start of a physical record; other malformed JSON remains an error that identifies its line.
