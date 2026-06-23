@@ -60,6 +60,12 @@ struct Record {
     array_index_paths: Vec<Vec<usize>>,
 }
 
+#[derive(Debug)]
+struct SchemaBuild {
+    records: Vec<Record>,
+    occurrences: Vec<Occurrence>,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     run(args)
@@ -71,7 +77,7 @@ fn run(args: Args) -> Result<()> {
     let (input, file_mode, base, source_is_jsonl) = read_input(&args)?;
     let jsonl_mode = args.jsonl || source_is_jsonl;
     let entries = normalize_input(&input, jsonl_mode, file_mode, &base)?;
-    let records = distinct_schemas(&args.outdir, entries)?;
+    let build = build_schema_output(&args.outdir, entries)?;
 
     if args.outdir.exists() {
         fs::remove_dir_all(&args.outdir)
@@ -80,8 +86,8 @@ fn run(args: Args) -> Result<()> {
     fs::create_dir_all(&args.outdir)
         .with_context(|| format!("failed to create {}", args.outdir.display()))?;
 
-    write_records(&records)?;
-    write_files_and_index(&args.outdir, &records)?;
+    write_records(&build.records)?;
+    write_files_and_index(&args.outdir, &build.records)?;
     Ok(())
 }
 
@@ -235,7 +241,7 @@ fn parse_jsonl_stream(input: &str) -> Result<Vec<Value>> {
     Ok(values)
 }
 
-fn distinct_schemas(outdir: &Path, entries: Vec<Entry>) -> Result<Vec<Record>> {
+fn build_schema_output(outdir: &Path, entries: Vec<Entry>) -> Result<SchemaBuild> {
     let mut occurrences = Vec::new();
     for entry in entries {
         let role = if entry.collection {
@@ -272,11 +278,19 @@ fn distinct_schemas(outdir: &Path, entries: Vec<Entry>) -> Result<Vec<Record>> {
     records.extend(root_collection_records(
         outdir,
         occurrences
-            .into_iter()
+            .iter()
             .filter(|o| o.role == Role::RootCollection)
+            .cloned()
             .collect(),
     )?);
-    Ok(records)
+    Ok(SchemaBuild {
+        records,
+        occurrences,
+    })
+}
+
+fn distinct_schemas(outdir: &Path, entries: Vec<Entry>) -> Result<Vec<Record>> {
+    Ok(build_schema_output(outdir, entries)?.records)
 }
 
 fn collect_object_occurrences(
@@ -791,6 +805,37 @@ mod tests {
 
     fn object(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn build_schema_output_retains_every_walked_object_occurrence() {
+        let build = build_schema_output(
+            Path::new("refs"),
+            vec![Entry {
+                path: vec!["root".to_string()],
+                index: None,
+                collection: false,
+                value: object(json!({
+                    "items": [
+                        {"meta": {"id": 1, "note": null}},
+                        {"meta": {"id": 2}}
+                    ]
+                })),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(build.occurrences.len(), 5);
+        assert!(build.occurrences.iter().any(|occurrence| {
+            occurrence.role == Role::Object
+                && occurrence.segments == vec!["root", "items", "meta"]
+                && occurrence.value.contains_key("note")
+        }));
+        assert!(build.occurrences.iter().any(|occurrence| {
+            occurrence.role == Role::ArrayItem
+                && occurrence.segments == vec!["root", "items"]
+                && occurrence.array_indexes == vec![1]
+        }));
     }
 
     #[test]
