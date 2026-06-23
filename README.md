@@ -1,17 +1,17 @@
-# json-refs
+# dump-json-refs
 
-## Build
+## install
 
 ```bash
-cargo build --release
+cargo install --git https://github.com/widehyo1/dump-json-refs.git
 ```
 
 Binary:
 
 ```bash
-./target/release/json-refs --outdir refs input.json
-./target/release/json-refs --jsonl --outdir refs input.jsonl
-cat input.json | ./target/release/json-refs --outdir refs
+dump-json-refs --outdir refs input.json
+dump-json-refs --jsonl --outdir refs input.jsonl
+cat input.json | dump-json-refs --outdir refs
 ```
 
 ## Output
@@ -36,6 +36,18 @@ CREATE TABLE array_index_refs (
   schema_path TEXT NOT NULL,
   PRIMARY KEY (array_path, array_index_path)
 );
+
+CREATE TABLE schema_object_counts (
+  schema_path TEXT PRIMARY KEY,
+  object_count INTEGER NOT NULL CHECK (object_count > 0)
+);
+
+CREATE TABLE schema_field_counts (
+  schema_path TEXT NOT NULL,
+  field_name TEXT NOT NULL,
+  field_count INTEGER NOT NULL CHECK (field_count > 0),
+  PRIMARY KEY (schema_path, field_name)
+);
 ```
 
 ## Semantics
@@ -53,3 +65,5 @@ CREATE TABLE array_index_refs (
 - Top-level collection:
   - homogeneous: one `<root_collection>.json`
   - heterogeneous: distinct `<root_collection>/<first_index>.json` files only
+
+Each walked JSON object increments the `object_count` of the canonical schema selected by `schema_paths` or `array_index_refs`. Each key present in that object increments its `field_count`; a key with a `null` value is present, while an omitted key is not. `$refs_mut` array containers are structural schemas, not objects, and are not counted.
