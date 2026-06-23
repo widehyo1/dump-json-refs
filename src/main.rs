@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -87,7 +87,7 @@ fn run(args: Args) -> Result<()> {
         .with_context(|| format!("failed to create {}", args.outdir.display()))?;
 
     write_records(&build.records)?;
-    write_files_and_index(&args.outdir, &build.records)?;
+    write_files_and_index(&args.outdir, &build.records, &build.occurrences)?;
     Ok(())
 }
 
@@ -289,6 +289,7 @@ fn build_schema_output(outdir: &Path, entries: Vec<Entry>) -> Result<SchemaBuild
     })
 }
 
+#[cfg(test)]
 fn distinct_schemas(outdir: &Path, entries: Vec<Entry>) -> Result<Vec<Record>> {
     Ok(build_schema_output(outdir, entries)?.records)
 }
@@ -710,7 +711,11 @@ fn write_records(records: &[Record]) -> Result<()> {
     Ok(())
 }
 
-fn write_files_and_index(outdir: &Path, records: &[Record]) -> Result<()> {
+fn write_files_and_index(
+    outdir: &Path,
+    records: &[Record],
+    occurrences: &[Occurrence],
+) -> Result<()> {
     let mut made_dirs = HashMap::<PathBuf, ()>::new();
 
     for record in records {
@@ -738,7 +743,9 @@ fn write_files_and_index(outdir: &Path, records: &[Record]) -> Result<()> {
     let tx = conn.transaction()?;
     tx.execute_batch(
         "CREATE TABLE schema_paths (schema_path TEXT NOT NULL, object_path TEXT PRIMARY KEY);
-         CREATE TABLE array_index_refs (array_path TEXT NOT NULL, array_index_path TEXT NOT NULL, schema_path TEXT NOT NULL, PRIMARY KEY (array_path, array_index_path));",
+         CREATE TABLE array_index_refs (array_path TEXT NOT NULL, array_index_path TEXT NOT NULL, schema_path TEXT NOT NULL, PRIMARY KEY (array_path, array_index_path));
+         CREATE TABLE schema_object_counts (schema_path TEXT PRIMARY KEY, object_count INTEGER NOT NULL CHECK (object_count > 0));
+         CREATE TABLE schema_field_counts (schema_path TEXT NOT NULL, field_name TEXT NOT NULL, field_count INTEGER NOT NULL CHECK (field_count > 0), PRIMARY KEY (schema_path, field_name));",
     )?;
 
     for record in records {
@@ -761,8 +768,63 @@ fn write_files_and_index(outdir: &Path, records: &[Record]) -> Result<()> {
             }
         }
     }
+    write_occurrence_statistics(&tx, outdir, occurrences)?;
     tx.commit()?;
     Ok(())
+}
+
+fn write_occurrence_statistics(
+    tx: &Transaction<'_>,
+    outdir: &Path,
+    occurrences: &[Occurrence],
+) -> Result<()> {
+    for occurrence in occurrences {
+        let schema_path = canonical_schema_path_for_occurrence(tx, outdir, occurrence)?;
+        tx.execute(
+            "INSERT INTO schema_object_counts(schema_path, object_count) VALUES (?1, 1) \
+             ON CONFLICT(schema_path) DO UPDATE SET object_count = schema_object_counts.object_count + 1",
+            params![&schema_path],
+        )?;
+        for field_name in occurrence.value.keys() {
+            tx.execute(
+                "INSERT INTO schema_field_counts(schema_path, field_name, field_count) VALUES (?1, ?2, 1) \
+                 ON CONFLICT(schema_path, field_name) DO UPDATE SET field_count = schema_field_counts.field_count + 1",
+                params![&schema_path, field_name],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn canonical_schema_path_for_occurrence(
+    tx: &Transaction<'_>,
+    outdir: &Path,
+    occurrence: &Occurrence,
+) -> Result<String> {
+    match occurrence.role {
+        Role::Object => {
+            let object_path = format!("{}.json", reference_path(outdir, &occurrence.segments));
+            tx.query_row(
+                "SELECT schema_path FROM schema_paths WHERE object_path = ?1",
+                params![&object_path],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("missing schema_paths entry for {object_path}"))
+        }
+        Role::ArrayItem | Role::RootCollection => {
+            let array_path = format!("{}.json", reference_path(outdir, &occurrence.segments));
+            let array_index_path = serde_json::to_string(&occurrence.array_indexes)?;
+            tx.query_row(
+                "SELECT schema_path FROM array_index_refs \
+                 WHERE array_path = ?1 AND array_index_path = ?2",
+                params![&array_path, &array_index_path],
+                |row| row.get(0),
+            )
+            .with_context(|| {
+                format!("missing array_index_refs entry for {array_path} at {array_index_path}")
+            })
+        }
+    }
 }
 
 fn ensure_parent(path: &Path, made_dirs: &mut HashMap<PathBuf, ()>) -> Result<()> {
@@ -805,6 +867,14 @@ mod tests {
 
     fn object(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()
+    }
+
+    fn temp_outdir(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("dump-json-refs-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 
     #[test]
@@ -960,7 +1030,7 @@ mod tests {
         let _ = fs::remove_dir_all(&outdir);
         fs::create_dir_all(&outdir).unwrap();
 
-        let records = distinct_schemas(
+        let build = build_schema_output(
             &outdir,
             vec![
                 Entry {
@@ -978,7 +1048,7 @@ mod tests {
             ],
         )
         .unwrap();
-        write_files_and_index(&outdir, &records).unwrap();
+        write_files_and_index(&outdir, &build.records, &build.occurrences).unwrap();
 
         let conn = Connection::open(outdir.join("schemas.sqlite")).unwrap();
         let mut stmt = conn
@@ -1000,6 +1070,146 @@ mod tests {
         drop(stmt);
         drop(conn);
         fs::remove_dir_all(&outdir).unwrap();
+    }
+
+    #[test]
+    fn sqlite_counts_object_fields_by_the_resolved_canonical_schema() {
+        let outdir = temp_outdir("field-counts");
+        let build = build_schema_output(
+            &outdir,
+            vec![Entry {
+                path: vec!["root".to_string()],
+                index: None,
+                collection: false,
+                value: object(json!({
+                    "items": [
+                        {"meta": {"id": 1, "note": null}},
+                        {"meta": {"id": 2}}
+                    ]
+                })),
+            }],
+        )
+        .unwrap();
+        write_files_and_index(&outdir, &build.records, &build.occurrences).unwrap();
+
+        let conn = Connection::open(outdir.join("schemas.sqlite")).unwrap();
+        let meta_path = format!("{}/root/items/meta.json", outdir.display());
+        let item_path = format!("{}/root/items.json", outdir.display());
+        assert_eq!(
+            conn.query_row(
+                "SELECT object_count FROM schema_object_counts WHERE schema_path = ?1",
+                [&meta_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT field_count FROM schema_field_counts \
+             WHERE schema_path = ?1 AND field_name = 'id'",
+                [&meta_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT field_count FROM schema_field_counts \
+             WHERE schema_path = ?1 AND field_name = 'note'",
+                [&meta_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT object_count FROM schema_object_counts WHERE schema_path = ?1",
+                [&item_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+
+        drop(conn);
+        fs::remove_dir_all(outdir).unwrap();
+    }
+
+    #[test]
+    fn sqlite_does_not_count_refs_mut_array_containers() {
+        let outdir = temp_outdir("refs-mut-counts");
+        let build = build_schema_output(
+            &outdir,
+            vec![Entry {
+                path: vec!["root".to_string()],
+                index: None,
+                collection: false,
+                value: object(json!({
+                    "items": [{"id": 1}, {"label": "second"}]
+                })),
+            }],
+        )
+        .unwrap();
+        write_files_and_index(&outdir, &build.records, &build.occurrences).unwrap();
+
+        let conn = Connection::open(outdir.join("schemas.sqlite")).unwrap();
+        let container_path = format!("{}/root/items.json", outdir.display());
+        let count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_object_counts WHERE schema_path = ?1",
+                [&container_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+
+        drop(conn);
+        fs::remove_dir_all(outdir).unwrap();
+    }
+
+    #[test]
+    fn sqlite_counts_homogeneous_root_collection_items_via_array_index_refs() {
+        let outdir = temp_outdir("root-collection-counts");
+        let build = build_schema_output(
+            &outdir,
+            vec![
+                Entry {
+                    path: vec!["root_item".to_string()],
+                    index: Some(0),
+                    collection: true,
+                    value: object(json!({"kind": "snapshot"})),
+                },
+                Entry {
+                    path: vec!["root_item".to_string()],
+                    index: Some(1),
+                    collection: true,
+                    value: object(json!({"kind": "event"})),
+                },
+            ],
+        )
+        .unwrap();
+        write_files_and_index(&outdir, &build.records, &build.occurrences).unwrap();
+
+        let conn = Connection::open(outdir.join("schemas.sqlite")).unwrap();
+        let root_path = format!("{}/root_item.json", outdir.display());
+        let counts = conn
+            .prepare(
+                "SELECT object_count, (SELECT field_count FROM schema_field_counts \
+             WHERE schema_path = ?1 AND field_name = 'kind') \
+             FROM schema_object_counts WHERE schema_path = ?1",
+            )
+            .unwrap()
+            .query_row([&root_path], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap();
+        assert_eq!(counts, (2, 2));
+
+        drop(conn);
+        fs::remove_dir_all(outdir).unwrap();
     }
 
     #[test]
