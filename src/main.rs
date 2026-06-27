@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use rusqlite::{params, Connection, Transaction};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -8,6 +9,25 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+const DEFAULT_GRAPH_OUTPUT: &str = "__default_graph_path__";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GraphFormat {
+    Mermaid,
+    MermaidMd,
+    Dot,
+}
+
+impl GraphFormat {
+    fn default_filename(self) -> &'static str {
+        match self {
+            GraphFormat::Mermaid => "schema.mmd",
+            GraphFormat::MermaidMd => "schema.md",
+            GraphFormat::Dot => "schema.dot",
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "dump-json-refs")]
@@ -34,6 +54,54 @@ struct Args {
         default_missing_value = "refs/schemas.sqlite"
     )]
     from_sqlite: Option<PathBuf>,
+
+    /// Generate a graph projection from SQLite schema relations.
+    ///
+    /// When FILE is omitted, the default path depends on --graph-format:
+    /// mermaid -> <outdir>/schema.mmd, mermaid-md -> <outdir>/schema.md,
+    /// dot -> <outdir>/schema.dot. In --from-sqlite mode, <outdir> is
+    /// replaced by the SQLite file's parent directory. Existing refs are not
+    /// removed in --from-sqlite mode.
+    #[arg(
+        long = "graph",
+        value_name = "FILE",
+        num_args = 0..=1,
+        default_missing_value = "__default_graph_path__"
+    )]
+    graph_output: Option<PathBuf>,
+
+    /// Graph output format. Also generates the graph when --graph is omitted.
+    ///
+    /// Mermaid is the default for quick GitHub/Markdown feedback.
+    #[arg(
+        long = "graph-format",
+        default_value_t = GraphFormat::Mermaid,
+        value_enum,
+        value_name = "mermaid|mermaid-md|dot",
+        hide_possible_values = true
+    )]
+    graph_format: GraphFormat,
+
+    /// Include structural marker relations such as nested array items.
+    ///
+    /// Also generates the graph when --graph is omitted.
+    #[arg(long = "graph-include-marked")]
+    graph_include_marked: bool,
+
+    /// Graph layout direction used by Mermaid and DOT output.
+    ///
+    /// Also generates the graph when --graph is omitted.
+    #[arg(
+        long = "graph-rankdir",
+        default_value = "LR",
+        value_name = "LR|TB|RL|BT",
+        value_parser = ["LR", "TB", "RL", "BT"],
+        hide_possible_values = true
+    )]
+    graph_rankdir: String,
+
+    #[arg(skip)]
+    graph_requested: bool,
 
     /// Output directory. It is removed and recreated.
     #[arg(long, default_value = "refs")]
@@ -84,8 +152,26 @@ struct SchemaBuild {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let graph_requested = graph_arg_was_provided(&matches);
+    let mut args = Args::from_arg_matches(&matches)?;
+    args.graph_requested = graph_requested;
     run(args)
+}
+
+fn graph_arg_was_provided(matches: &clap::ArgMatches) -> bool {
+    [
+        "graph_output",
+        "graph_format",
+        "graph_include_marked",
+        "graph_rankdir",
+    ]
+    .iter()
+    .any(|id| {
+        matches
+            .value_source(id)
+            .is_some_and(|source| source == ValueSource::CommandLine)
+    })
 }
 
 fn run(args: Args) -> Result<()> {
@@ -102,6 +188,22 @@ fn run(args: Args) -> Result<()> {
             },
             args.report_output.as_deref(),
         )?;
+
+        if let Some(graph_output) = resolve_graph_output_path(
+            args.graph_requested,
+            args.graph_output.as_deref(),
+            &args.outdir,
+            Some(sqlite_path),
+            args.graph_format,
+        ) {
+            write_graph_from_sqlite(
+                sqlite_path,
+                &graph_output,
+                args.graph_include_marked,
+                &args.graph_rankdir,
+                args.graph_format,
+            )?;
+        }
         return Ok(());
     }
 
@@ -143,6 +245,23 @@ fn run(args: Args) -> Result<()> {
         },
         args.report_output.as_deref(),
     )?;
+
+    if let Some(graph_output) = resolve_graph_output_path(
+        args.graph_requested,
+        args.graph_output.as_deref(),
+        &args.outdir,
+        None,
+        args.graph_format,
+    ) {
+        write_graph_from_sqlite(
+            &database,
+            &graph_output,
+            args.graph_include_marked,
+            &args.graph_rankdir,
+            args.graph_format,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1139,6 +1258,366 @@ fn render_summary(
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DotNode {
+    schema_path: String,
+    schema_kind: String,
+    object_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DotRelation {
+    from_schema_path: String,
+    to_schema_path: String,
+    relation_kind: String,
+    fk_owner: String,
+    fk_candidate: bool,
+    field_name: String,
+    cardinality: String,
+    required: bool,
+    mixed: bool,
+    nested_array_depth: usize,
+    via_schema_path: Option<String>,
+    via_array_path: Option<String>,
+    parent_object_count: i64,
+    child_object_count: i64,
+    field_count: i64,
+}
+
+fn resolve_graph_output_path(
+    graph_requested: bool,
+    graph_output: Option<&Path>,
+    outdir: &Path,
+    from_sqlite: Option<&Path>,
+    graph_format: GraphFormat,
+) -> Option<PathBuf> {
+    if !graph_requested {
+        return None;
+    }
+
+    if let Some(graph_output) = graph_output {
+        if graph_output != Path::new(DEFAULT_GRAPH_OUTPUT) {
+            return Some(graph_output.to_path_buf());
+        }
+    }
+
+    if let Some(sqlite_path) = from_sqlite {
+        return Some(
+            sqlite_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(graph_format.default_filename()),
+        );
+    }
+
+    Some(outdir.join(graph_format.default_filename()))
+}
+
+fn write_graph_from_sqlite(
+    database: &Path,
+    output_path: &Path,
+    include_marked: bool,
+    rankdir: &str,
+    graph_format: GraphFormat,
+) -> Result<()> {
+    if !database.exists() {
+        bail!("SQLite graph source does not exist: {}", database.display());
+    }
+
+    let conn = Connection::open(database)
+        .with_context(|| format!("failed to open SQLite graph source: {}", database.display()))?;
+    ensure_graph_tables_exist(&conn)?;
+    let (nodes, relations) = load_graph_data(&conn, include_marked)?;
+    let rendered = match graph_format {
+        GraphFormat::Mermaid => render_mermaid_graph(&nodes, &relations, rankdir, false),
+        GraphFormat::MermaidMd => render_mermaid_graph(&nodes, &relations, rankdir, true),
+        GraphFormat::Dot => render_dot_graph(&nodes, &relations, rankdir),
+    };
+    write_text_file(output_path, &rendered)
+}
+
+fn ensure_graph_tables_exist(conn: &Connection) -> Result<()> {
+    ensure_table_has_column(
+        conn,
+        "schema_relations",
+        "relation_kind",
+        "SQLite graph source does not contain schema_relations; regenerate refs with the current dump-json-refs version",
+    )?;
+    ensure_table_has_column(
+        conn,
+        "schema_relations",
+        "fk_candidate",
+        "SQLite graph source does not contain schema_relations.fk_candidate; regenerate refs with the current dump-json-refs version",
+    )?;
+    ensure_table_has_column(
+        conn,
+        "schema_relations",
+        "nested_array_depth",
+        "SQLite graph source does not contain schema_relations.nested_array_depth; regenerate refs with the current dump-json-refs version",
+    )?;
+    Ok(())
+}
+
+fn load_graph_data(
+    conn: &Connection,
+    include_marked: bool,
+) -> Result<(Vec<DotNode>, Vec<DotRelation>)> {
+    let relation_filter = if include_marked {
+        ""
+    } else {
+        "WHERE fk_candidate = 1"
+    };
+    let mut relation_stmt = conn.prepare(&format!(
+        "SELECT from_schema_path, to_schema_path, relation_kind, fk_owner, fk_candidate, \
+                field_name, cardinality, required, mixed, nested_array_depth, \
+                via_schema_path, via_array_path, parent_object_count, child_object_count, field_count \
+         FROM schema_relations \
+         {relation_filter} \
+         ORDER BY fk_candidate DESC, relation_kind, from_schema_path, to_schema_path, field_name"
+    ))?;
+
+    let relations = relation_stmt
+        .query_map([], |row| {
+            Ok(DotRelation {
+                from_schema_path: row.get(0)?,
+                to_schema_path: row.get(1)?,
+                relation_kind: row.get(2)?,
+                fk_owner: row.get(3)?,
+                fk_candidate: row.get::<_, i64>(4)? == 1,
+                field_name: row.get(5)?,
+                cardinality: row.get(6)?,
+                required: row.get::<_, i64>(7)? == 1,
+                mixed: row.get::<_, i64>(8)? == 1,
+                nested_array_depth: row.get::<_, i64>(9)? as usize,
+                via_schema_path: row.get(10)?,
+                via_array_path: row.get(11)?,
+                parent_object_count: row.get(12)?,
+                child_object_count: row.get(13)?,
+                field_count: row.get(14)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut used_paths = BTreeSet::<String>::new();
+    for relation in &relations {
+        used_paths.insert(relation.from_schema_path.clone());
+        used_paths.insert(relation.to_schema_path.clone());
+    }
+
+    let mut node_stmt = conn.prepare(
+        "SELECT d.schema_path, d.schema_kind, COALESCE(c.object_count, 0) AS object_count \
+         FROM schema_definitions AS d \
+         LEFT JOIN schema_object_counts AS c ON c.schema_path = d.schema_path \
+         ORDER BY object_count DESC, d.schema_path",
+    )?;
+    let nodes = node_stmt
+        .query_map([], |row| {
+            Ok(DotNode {
+                schema_path: row.get(0)?,
+                schema_kind: row.get(1)?,
+                object_count: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|node| used_paths.contains(&node.schema_path))
+        .collect::<Vec<_>>();
+
+    Ok((nodes, relations))
+}
+
+fn render_mermaid_graph(
+    nodes: &[DotNode],
+    relations: &[DotRelation],
+    rankdir: &str,
+    markdown_fence: bool,
+) -> String {
+    let mut out = String::new();
+    if markdown_fence {
+        out.push_str("```mermaid\n");
+    }
+    out.push_str(&format!("flowchart {}\n", mermaid_direction(rankdir)));
+
+    let mut node_ids = HashMap::<String, String>::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let id = format!("n{index}");
+        node_ids.insert(node.schema_path.clone(), id.clone());
+        let label = format!(
+            "{}<br/>kind={}<br/>object_count={}",
+            node.schema_path, node.schema_kind, node.object_count
+        );
+        out.push_str(&format!("  {id}[\"{}\"]\n", mermaid_label(&label)));
+    }
+
+    if !nodes.is_empty() {
+        out.push('\n');
+    }
+
+    for relation in relations {
+        let Some(from_id) = node_ids.get(&relation.from_schema_path) else {
+            continue;
+        };
+        let Some(to_id) = node_ids.get(&relation.to_schema_path) else {
+            continue;
+        };
+
+        let mut label = vec![
+            relation_edge_label(relation),
+            relation.relation_kind.clone(),
+            relation.cardinality.clone(),
+        ];
+        if relation.required {
+            label.push("required".to_string());
+        } else {
+            label.push("optional".to_string());
+        }
+        if relation.mixed {
+            label.push("mixed".to_string());
+        }
+        if relation.nested_array_depth >= 2 {
+            label.push(format!("depth={}", relation.nested_array_depth));
+        }
+        let label = mermaid_label(&label.join("<br/>"));
+
+        if relation.fk_candidate {
+            out.push_str(&format!("  {from_id} -->|\"{label}\"| {to_id}\n"));
+        } else {
+            out.push_str(&format!("  {from_id} -. \"{label}\" .-> {to_id}\n"));
+        }
+    }
+
+    if markdown_fence {
+        out.push_str("```\n");
+    }
+    out
+}
+
+fn mermaid_direction(rankdir: &str) -> &'static str {
+    match rankdir {
+        "LR" => "LR",
+        "TB" => "TB",
+        "RL" => "RL",
+        "BT" => "BT",
+        _ => "LR",
+    }
+}
+
+fn mermaid_label(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('|', "&#124;")
+}
+
+fn render_dot_graph(nodes: &[DotNode], relations: &[DotRelation], rankdir: &str) -> String {
+    let mut out = String::new();
+    out.push_str("digraph schema_fk {\n");
+    out.push_str(&format!("  rankdir={};\n", dot_id(rankdir)));
+    out.push_str("  node [shape=box];\n\n");
+
+    for node in nodes {
+        let label = format!(
+            "{}\nkind={}\nobject_count={}",
+            node.schema_path, node.schema_kind, node.object_count
+        );
+        out.push_str(&format!(
+            "  {} [label={}, schema_kind={}, object_count={}];\n",
+            dot_string(&node.schema_path),
+            dot_string(&label),
+            dot_string(&node.schema_kind),
+            dot_string(&node.object_count.to_string()),
+        ));
+    }
+
+    if !nodes.is_empty() {
+        out.push('\n');
+    }
+
+    for relation in relations {
+        let label = relation_edge_label(relation);
+        let mut attributes = vec![
+            ("label".to_string(), label),
+            ("relation_kind".to_string(), relation.relation_kind.clone()),
+            ("fk_owner".to_string(), relation.fk_owner.clone()),
+            (
+                "fk_candidate".to_string(),
+                relation.fk_candidate.to_string(),
+            ),
+            ("field_name".to_string(), relation.field_name.clone()),
+            ("cardinality".to_string(), relation.cardinality.clone()),
+            ("required".to_string(), relation.required.to_string()),
+            ("mixed".to_string(), relation.mixed.to_string()),
+            (
+                "nested_array_depth".to_string(),
+                relation.nested_array_depth.to_string(),
+            ),
+            (
+                "parent_object_count".to_string(),
+                relation.parent_object_count.to_string(),
+            ),
+            (
+                "child_object_count".to_string(),
+                relation.child_object_count.to_string(),
+            ),
+            ("field_count".to_string(), relation.field_count.to_string()),
+        ];
+
+        if let Some(via_schema_path) = &relation.via_schema_path {
+            attributes.push(("via_schema_path".to_string(), via_schema_path.clone()));
+        }
+        if let Some(via_array_path) = &relation.via_array_path {
+            attributes.push(("via_array_path".to_string(), via_array_path.clone()));
+        }
+        if !relation.fk_candidate {
+            attributes.push(("style".to_string(), "dashed".to_string()));
+        }
+
+        out.push_str(&format!(
+            "  {} -> {} [{}];\n",
+            dot_string(&relation.from_schema_path),
+            dot_string(&relation.to_schema_path),
+            attributes
+                .into_iter()
+                .map(|(key, value)| format!("{}={}", key, dot_string(&value)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+
+    out.push_str("}\n");
+    out
+}
+
+fn relation_edge_label(relation: &DotRelation) -> String {
+    match relation.relation_kind.as_str() {
+        "object_ref" => relation.field_name.clone(),
+        "array_item" | "heterogeneous_array_item" => format!("{}[*]", relation.field_name),
+        "nested_array_item" => {
+            let suffix = (0..relation.nested_array_depth)
+                .map(|_| "[*]")
+                .collect::<Vec<_>>()
+                .join("");
+            format!("{}{}", relation.field_name, suffix)
+        }
+        _ => relation.field_name.clone(),
+    }
+}
+
+fn dot_id(value: &str) -> String {
+    match value {
+        "LR" | "TB" | "RL" | "BT" => value.to_string(),
+        _ => "LR".to_string(),
+    }
+}
+
+fn dot_string(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!("\"{escaped}\"")
+}
+
 fn write_files_and_index(
     outdir: &Path,
     records: &[Record],
@@ -1178,7 +1657,12 @@ fn write_files_and_index(
          CREATE TABLE array_index_refs (array_path TEXT NOT NULL, array_index_path TEXT NOT NULL, schema_path TEXT NOT NULL, PRIMARY KEY (array_path, array_index_path));
          CREATE TABLE schema_definitions (schema_path TEXT PRIMARY KEY, schema_kind TEXT NOT NULL, schema_json TEXT NOT NULL);
          CREATE TABLE schema_object_counts (schema_path TEXT PRIMARY KEY, object_count INTEGER NOT NULL CHECK (object_count > 0));
-         CREATE TABLE schema_field_counts (schema_path TEXT NOT NULL, field_name TEXT NOT NULL, field_type TEXT NOT NULL, field_count INTEGER NOT NULL CHECK (field_count > 0), PRIMARY KEY (schema_path, field_name));",
+         CREATE TABLE schema_field_counts (schema_path TEXT NOT NULL, field_name TEXT NOT NULL, field_type TEXT NOT NULL, field_count INTEGER NOT NULL CHECK (field_count > 0), PRIMARY KEY (schema_path, field_name));
+         CREATE TABLE schema_relations (relation_id INTEGER PRIMARY KEY AUTOINCREMENT, from_schema_path TEXT NOT NULL, to_schema_path TEXT NOT NULL, relation_kind TEXT NOT NULL, fk_owner TEXT NOT NULL, fk_candidate INTEGER NOT NULL CHECK (fk_candidate IN (0, 1)), field_name TEXT NOT NULL, field_type TEXT NOT NULL, cardinality TEXT NOT NULL, required INTEGER NOT NULL CHECK (required IN (0, 1)), mixed INTEGER NOT NULL CHECK (mixed IN (0, 1)), nested_array_depth INTEGER NOT NULL DEFAULT 0 CHECK (nested_array_depth >= 0), via_schema_path TEXT, via_array_path TEXT, parent_schema_path TEXT NOT NULL, child_schema_path TEXT NOT NULL, parent_object_count INTEGER NOT NULL DEFAULT 0 CHECK (parent_object_count >= 0), child_object_count INTEGER NOT NULL DEFAULT 0 CHECK (child_object_count >= 0), field_count INTEGER NOT NULL DEFAULT 0 CHECK (field_count >= 0), UNIQUE (from_schema_path, to_schema_path, relation_kind, field_name, field_type, via_schema_path, via_array_path));
+         CREATE INDEX idx_schema_relations_from ON schema_relations(from_schema_path);
+         CREATE INDEX idx_schema_relations_to ON schema_relations(to_schema_path);
+         CREATE INDEX idx_schema_relations_kind ON schema_relations(relation_kind, fk_candidate);
+         CREATE INDEX idx_schema_relations_parent_child ON schema_relations(parent_schema_path, child_schema_path);",
     )?;
 
     for record in records {
@@ -1210,6 +1694,7 @@ fn write_files_and_index(
         }
     }
     write_occurrence_statistics(&tx, outdir, records, occurrences)?;
+    write_schema_relations(&tx, records)?;
     tx.commit()?;
     Ok(())
 }
@@ -1275,6 +1760,349 @@ fn write_occurrence_statistics(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelationTarget {
+    target_schema_path: String,
+    array_depth: usize,
+    mixed: bool,
+    optional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaRelation {
+    from_schema_path: String,
+    to_schema_path: String,
+    relation_kind: String,
+    fk_owner: String,
+    fk_candidate: bool,
+    field_name: String,
+    field_type: String,
+    cardinality: String,
+    required: bool,
+    mixed: bool,
+    nested_array_depth: usize,
+    via_schema_path: Option<String>,
+    via_array_path: Option<String>,
+    parent_schema_path: String,
+    child_schema_path: String,
+    parent_object_count: i64,
+    child_object_count: i64,
+    field_count: i64,
+}
+
+fn write_schema_relations(tx: &Transaction<'_>, records: &[Record]) -> Result<()> {
+    let schema_kinds = records
+        .iter()
+        .map(|record| {
+            (
+                record.schema_path.clone(),
+                schema_kind(&record.schema).to_string(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut variants_by_array_parent = HashMap::<String, Vec<String>>::new();
+    for record in records {
+        if let Some(array_parent) = &record.array_parent {
+            if record.schema_path != *array_parent {
+                variants_by_array_parent
+                    .entry(array_parent.clone())
+                    .or_default()
+                    .push(record.schema_path.clone());
+            }
+        }
+    }
+    for variants in variants_by_array_parent.values_mut() {
+        variants.sort();
+        variants.dedup();
+    }
+
+    for record in records {
+        let Some(schema) = record.schema.as_object() else {
+            continue;
+        };
+        if is_refs_mut_schema(schema) {
+            continue;
+        }
+
+        let parent_schema_path = &record.schema_path;
+        let parent_object_count = object_count_for_schema(tx, parent_schema_path)?;
+
+        for (field_name, field_type_value) in schema {
+            let Some(field_type) = field_type_value.as_str() else {
+                continue;
+            };
+
+            let field_count = field_count_for_schema(tx, parent_schema_path, field_name)?;
+            if field_count == 0 {
+                continue;
+            }
+            let required = parent_object_count > 0 && field_count == parent_object_count;
+
+            for target in relation_targets_from_field_type(field_type) {
+                let target_kind = schema_kinds
+                    .get(&target.target_schema_path)
+                    .map(String::as_str)
+                    .unwrap_or("object");
+
+                if target.array_depth == 0 {
+                    if target_kind == "heterogeneous" {
+                        continue;
+                    }
+                    let child_schema_path = target.target_schema_path.clone();
+                    let relation = SchemaRelation {
+                        from_schema_path: parent_schema_path.clone(),
+                        to_schema_path: child_schema_path.clone(),
+                        relation_kind: "object_ref".to_string(),
+                        fk_owner: "parent".to_string(),
+                        fk_candidate: true,
+                        field_name: field_name.clone(),
+                        field_type: field_type.to_string(),
+                        cardinality: if required {
+                            "one_to_one_candidate".to_string()
+                        } else {
+                            "zero_or_one_to_one_candidate".to_string()
+                        },
+                        required,
+                        mixed: target.mixed,
+                        nested_array_depth: 0,
+                        via_schema_path: None,
+                        via_array_path: None,
+                        parent_schema_path: parent_schema_path.clone(),
+                        child_schema_path: child_schema_path.clone(),
+                        parent_object_count,
+                        child_object_count: object_count_for_schema(tx, &child_schema_path)?,
+                        field_count,
+                    };
+                    insert_schema_relation(tx, &relation)?;
+                    continue;
+                }
+
+                let via_array_path = Some(target.target_schema_path.clone());
+                if target.array_depth >= 2 {
+                    let children = if target_kind == "heterogeneous" {
+                        variants_by_array_parent
+                            .get(&target.target_schema_path)
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        vec![target.target_schema_path.clone()]
+                    };
+                    for child_schema_path in children {
+                        let relation = SchemaRelation {
+                            from_schema_path: child_schema_path.clone(),
+                            to_schema_path: parent_schema_path.clone(),
+                            relation_kind: "nested_array_item".to_string(),
+                            fk_owner: "child".to_string(),
+                            fk_candidate: false,
+                            field_name: field_name.clone(),
+                            field_type: field_type.to_string(),
+                            cardinality: "nested_many_to_one_marker".to_string(),
+                            required,
+                            mixed: target.mixed,
+                            nested_array_depth: target.array_depth,
+                            via_schema_path: if target_kind == "heterogeneous" {
+                                Some(target.target_schema_path.clone())
+                            } else {
+                                Some(child_schema_path.clone())
+                            },
+                            via_array_path: via_array_path.clone(),
+                            parent_schema_path: parent_schema_path.clone(),
+                            child_schema_path: child_schema_path.clone(),
+                            parent_object_count,
+                            child_object_count: object_count_for_schema(tx, &child_schema_path)?,
+                            field_count,
+                        };
+                        insert_schema_relation(tx, &relation)?;
+                    }
+                    continue;
+                }
+
+                if target_kind == "heterogeneous" {
+                    for child_schema_path in variants_by_array_parent
+                        .get(&target.target_schema_path)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        let relation = SchemaRelation {
+                            from_schema_path: child_schema_path.clone(),
+                            to_schema_path: parent_schema_path.clone(),
+                            relation_kind: "heterogeneous_array_item".to_string(),
+                            fk_owner: "child".to_string(),
+                            fk_candidate: true,
+                            field_name: field_name.clone(),
+                            field_type: field_type.to_string(),
+                            cardinality: "many_to_one".to_string(),
+                            required,
+                            mixed: target.mixed,
+                            nested_array_depth: 1,
+                            via_schema_path: Some(target.target_schema_path.clone()),
+                            via_array_path: via_array_path.clone(),
+                            parent_schema_path: parent_schema_path.clone(),
+                            child_schema_path: child_schema_path.clone(),
+                            parent_object_count,
+                            child_object_count: object_count_for_schema(tx, &child_schema_path)?,
+                            field_count,
+                        };
+                        insert_schema_relation(tx, &relation)?;
+                    }
+                } else {
+                    let child_schema_path = target.target_schema_path.clone();
+                    let relation = SchemaRelation {
+                        from_schema_path: child_schema_path.clone(),
+                        to_schema_path: parent_schema_path.clone(),
+                        relation_kind: "array_item".to_string(),
+                        fk_owner: "child".to_string(),
+                        fk_candidate: true,
+                        field_name: field_name.clone(),
+                        field_type: field_type.to_string(),
+                        cardinality: "many_to_one".to_string(),
+                        required,
+                        mixed: target.mixed,
+                        nested_array_depth: 1,
+                        via_schema_path: Some(child_schema_path.clone()),
+                        via_array_path,
+                        parent_schema_path: parent_schema_path.clone(),
+                        child_schema_path: child_schema_path.clone(),
+                        parent_object_count,
+                        child_object_count: object_count_for_schema(tx, &child_schema_path)?,
+                        field_count,
+                    };
+                    insert_schema_relation(tx, &relation)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn insert_schema_relation(tx: &Transaction<'_>, relation: &SchemaRelation) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO schema_relations(\
+         from_schema_path, to_schema_path, relation_kind, fk_owner, fk_candidate, \
+         field_name, field_type, cardinality, required, mixed, nested_array_depth, \
+         via_schema_path, via_array_path, parent_schema_path, child_schema_path, \
+         parent_object_count, child_object_count, field_count) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        params![
+            &relation.from_schema_path,
+            &relation.to_schema_path,
+            &relation.relation_kind,
+            &relation.fk_owner,
+            relation.fk_candidate as i64,
+            &relation.field_name,
+            &relation.field_type,
+            &relation.cardinality,
+            relation.required as i64,
+            relation.mixed as i64,
+            relation.nested_array_depth as i64,
+            relation.via_schema_path.as_deref(),
+            relation.via_array_path.as_deref(),
+            &relation.parent_schema_path,
+            &relation.child_schema_path,
+            relation.parent_object_count,
+            relation.child_object_count,
+            relation.field_count,
+        ],
+    )?;
+    Ok(())
+}
+
+fn object_count_for_schema(tx: &Transaction<'_>, schema_path: &str) -> Result<i64> {
+    tx.query_row(
+        "SELECT COALESCE((SELECT object_count FROM schema_object_counts WHERE schema_path = ?1), 0)",
+        params![schema_path],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("failed to read object count for {schema_path}"))
+}
+
+fn field_count_for_schema(
+    tx: &Transaction<'_>,
+    schema_path: &str,
+    field_name: &str,
+) -> Result<i64> {
+    tx.query_row(
+        "SELECT COALESCE((SELECT field_count FROM schema_field_counts WHERE schema_path = ?1 AND field_name = ?2), 0)",
+        params![schema_path, field_name],
+        |row| row.get(0),
+    )
+    .with_context(|| format!("failed to read field count for {schema_path}.{field_name}"))
+}
+
+fn relation_targets_from_field_type(field_type: &str) -> Vec<RelationTarget> {
+    let optional = field_type.ends_with('?');
+    let trimmed = field_type.trim_end_matches('?');
+    let mut targets = relation_targets_from_label(trimmed, 0, optional);
+    targets.sort_by(|a, b| {
+        a.target_schema_path
+            .cmp(&b.target_schema_path)
+            .then(a.array_depth.cmp(&b.array_depth))
+    });
+    targets.dedup();
+    targets
+}
+
+fn relation_targets_from_label(
+    label: &str,
+    array_depth: usize,
+    inherited_optional: bool,
+) -> Vec<RelationTarget> {
+    let parts = split_top_level_union(label);
+    let mixed_here = parts.len() > 1;
+    let mut out = Vec::new();
+
+    for part in parts {
+        let part = part.trim();
+        if let Some(inner) = array_inner(part) {
+            for mut target in
+                relation_targets_from_label(inner, array_depth + 1, inherited_optional)
+            {
+                target.mixed |= mixed_here;
+                out.push(target);
+            }
+        } else if part.ends_with(".json") {
+            out.push(RelationTarget {
+                target_schema_path: part.to_string(),
+                array_depth,
+                mixed: mixed_here,
+                optional: inherited_optional,
+            });
+        }
+    }
+
+    out
+}
+
+fn split_top_level_union(label: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+
+    for (idx, ch) in label.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => {
+                parts.push(&label[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    parts.push(&label[start..]);
+    parts
+}
+
+fn array_inner(label: &str) -> Option<&str> {
+    if !label.starts_with("array(") || !label.ends_with(')') {
+        return None;
+    }
+    Some(&label[6..label.len() - 1])
 }
 
 fn canonical_schema_path_for_occurrence(
