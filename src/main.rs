@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(name = "dump-json-refs")]
@@ -19,6 +20,20 @@ struct Args {
     /// Output compact one-line JSON files under the refs directory.
     #[arg(short = 'c', long = "compact-output")]
     compact_output: bool,
+
+    /// Write the full report to this file. Stdout prints only the summary.
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    report_output: Option<PathBuf>,
+
+    /// Read report data from an existing SQLite index instead of generating refs.
+    /// When the flag is used without a value, refs/schemas.sqlite is used.
+    #[arg(
+        long = "from-sqlite",
+        value_name = "FILE",
+        num_args = 0..=1,
+        default_missing_value = "refs/schemas.sqlite"
+    )]
+    from_sqlite: Option<PathBuf>,
 
     /// Output directory. It is removed and recreated.
     #[arg(long, default_value = "refs")]
@@ -74,7 +89,30 @@ fn main() -> Result<()> {
 }
 
 fn run(args: Args) -> Result<()> {
+    if let Some(sqlite_path) = args.from_sqlite.as_deref() {
+        if args.input_file.is_some() {
+            bail!("input file cannot be used with --from-sqlite");
+        }
+
+        let report = load_report_from_sqlite(sqlite_path)?;
+        emit_report(
+            &report,
+            &ReportSummary::FromSqlite {
+                sqlite_path: sqlite_path.display().to_string(),
+            },
+            args.report_output.as_deref(),
+        )?;
+        return Ok(());
+    }
+
+    let started = Instant::now();
     reject_unsafe_outdir(&args.outdir)?;
+
+    let input_source = args
+        .input_file
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "stdin".to_string());
 
     let (input, file_mode, base, source_is_jsonl) = read_input(&args)?;
     let jsonl_mode = args.jsonl || source_is_jsonl;
@@ -88,12 +126,22 @@ fn run(args: Args) -> Result<()> {
     fs::create_dir_all(&args.outdir)
         .with_context(|| format!("failed to create {}", args.outdir.display()))?;
 
-    write_records(&build.records)?;
     write_files_and_index(
         &args.outdir,
         &build.records,
         &build.occurrences,
         args.compact_output,
+    )?;
+
+    let database = args.outdir.join("schemas.sqlite");
+    let report = load_report_from_sqlite(&database)?;
+    emit_report(
+        &report,
+        &ReportSummary::Generated {
+            execution_time_ms: started.elapsed().as_millis(),
+            input_source,
+        },
+        args.report_output.as_deref(),
     )?;
     Ok(())
 }
@@ -141,31 +189,52 @@ fn normalize_input(
     }
 
     if jsonl_mode {
-        let root = if file_mode {
-            format!("{base}_ref")
-        } else {
-            "root_item".to_string()
-        };
         let values = parse_jsonl_stream(input)?;
-        if values.is_empty() {
-            bail!("input is empty");
-        }
-        return values
-            .into_iter()
-            .enumerate()
-            .map(|(i, value)| match value {
-                Value::Object(map) => Ok(Entry {
-                    path: vec![root.clone()],
-                    index: Some(i),
-                    collection: true,
-                    value: map,
-                }),
-                _ => bail!("JSONL values must be objects"),
-            })
-            .collect();
+        return normalize_jsonl_values(values, file_mode, base);
     }
 
-    let values = parse_json_stream(input)?;
+    let values = match parse_json_stream(input) {
+        Ok(values) => values,
+        Err(json_error) => {
+            return match parse_jsonl_stream(input) {
+                Ok(values) => normalize_jsonl_values(values, file_mode, base),
+                Err(jsonl_error) => Err(json_error).with_context(|| {
+                    format!("invalid JSON input; JSONL fallback also failed: {jsonl_error}")
+                }),
+            };
+        }
+    };
+
+    normalize_json_values(values, file_mode, base)
+}
+
+fn normalize_jsonl_values(values: Vec<Value>, file_mode: bool, base: &str) -> Result<Vec<Entry>> {
+    let root = if file_mode {
+        format!("{base}_ref")
+    } else {
+        "root_item".to_string()
+    };
+
+    if values.is_empty() {
+        bail!("input is empty");
+    }
+
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(i, value)| match value {
+            Value::Object(map) => Ok(Entry {
+                path: vec![root.clone()],
+                index: Some(i),
+                collection: true,
+                value: map,
+            }),
+            _ => bail!("JSONL values must be objects"),
+        })
+        .collect()
+}
+
+fn normalize_json_values(values: Vec<Value>, file_mode: bool, base: &str) -> Result<Vec<Entry>> {
     if values.is_empty() {
         bail!("input is empty");
     }
@@ -711,11 +780,363 @@ fn canonical_json(value: &Value) -> Result<String> {
     }
 }
 
-fn write_records(records: &[Record]) -> Result<()> {
-    for record in records {
-        println!("{}", serde_json::to_string(record)?);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaCount {
+    schema_path: String,
+    schema_kind: String,
+    object_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaObjectPath {
+    schema_path: String,
+    object_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SchemaArrayIndexRef {
+    schema_path: String,
+    array_path: String,
+    array_index_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FieldCount {
+    schema_path: String,
+    field_name: String,
+    field_type: String,
+    field_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportData {
+    schemas: Vec<SchemaCount>,
+    object_paths: Vec<SchemaObjectPath>,
+    array_index_refs: Vec<SchemaArrayIndexRef>,
+    fields: Vec<FieldCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReportSummary {
+    Generated {
+        execution_time_ms: u128,
+        input_source: String,
+    },
+    FromSqlite {
+        sqlite_path: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportDetail {
+    CompactStdout,
+    FullFile,
+}
+
+fn load_report_from_sqlite(database: &Path) -> Result<ReportData> {
+    if !database.exists() {
+        bail!(
+            "SQLite report source does not exist: {}",
+            database.display()
+        );
     }
+
+    let conn = Connection::open(database).with_context(|| {
+        format!(
+            "failed to open SQLite report source: {}",
+            database.display()
+        )
+    })?;
+    read_report_data(&conn)
+}
+
+fn read_report_data(conn: &Connection) -> Result<ReportData> {
+    ensure_field_type_column_exists(conn)?;
+
+    let schema_order_sql = "SELECT paths.schema_path, defs.schema_kind, COALESCE(counts.object_count, 0) AS object_count \
+         FROM (SELECT DISTINCT schema_path FROM schema_paths) AS paths \
+         JOIN schema_definitions AS defs ON defs.schema_path = paths.schema_path \
+         LEFT JOIN schema_object_counts AS counts ON counts.schema_path = paths.schema_path";
+
+    let mut schema_stmt = conn.prepare(&format!(
+        "{schema_order_sql} \
+         ORDER BY object_count DESC, paths.schema_path"
+    ))?;
+
+    let schemas = schema_stmt
+        .query_map([], |row| {
+            Ok(SchemaCount {
+                schema_path: row.get(0)?,
+                schema_kind: row.get(1)?,
+                object_count: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut object_path_stmt = conn.prepare(&format!(
+        "SELECT p.schema_path, p.object_path \
+         FROM schema_paths AS p \
+         JOIN ({schema_order_sql}) AS schema_order ON schema_order.schema_path = p.schema_path \
+         ORDER BY schema_order.object_count DESC, p.schema_path, p.object_path"
+    ))?;
+
+    let object_paths = object_path_stmt
+        .query_map([], |row| {
+            Ok(SchemaObjectPath {
+                schema_path: row.get(0)?,
+                object_path: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut array_index_stmt = conn.prepare(&format!(
+        "SELECT r.schema_path, r.array_path, r.array_index_path \
+         FROM array_index_refs AS r \
+         JOIN ({schema_order_sql}) AS schema_order ON schema_order.schema_path = r.schema_path \
+         ORDER BY schema_order.object_count DESC, r.schema_path, r.array_path, r.array_index_path"
+    ))?;
+
+    let array_index_refs = array_index_stmt
+        .query_map([], |row| {
+            Ok(SchemaArrayIndexRef {
+                schema_path: row.get(0)?,
+                array_path: row.get(1)?,
+                array_index_path: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut field_stmt = conn.prepare(&format!(
+        "SELECT f.schema_path, f.field_name, f.field_type, f.field_count \
+         FROM schema_field_counts AS f \
+         JOIN ({schema_order_sql}) AS schema_order ON schema_order.schema_path = f.schema_path \
+         ORDER BY schema_order.object_count DESC, f.schema_path, f.field_count DESC, f.field_name"
+    ))?;
+
+    let fields = field_stmt
+        .query_map([], |row| {
+            Ok(FieldCount {
+                schema_path: row.get(0)?,
+                field_name: row.get(1)?,
+                field_type: row.get(2)?,
+                field_count: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(ReportData {
+        schemas,
+        object_paths,
+        array_index_refs,
+        fields,
+    })
+}
+
+fn ensure_field_type_column_exists(conn: &Connection) -> Result<()> {
+    ensure_table_has_column(
+        conn,
+        "schema_field_counts",
+        "field_type",
+        "SQLite report source does not contain schema_field_counts.field_type; regenerate refs with the current dump-json-refs version",
+    )?;
+    ensure_table_has_column(
+        conn,
+        "schema_definitions",
+        "schema_kind",
+        "SQLite report source does not contain schema_definitions.schema_kind; regenerate refs with the current dump-json-refs version",
+    )?;
     Ok(())
+}
+
+fn ensure_table_has_column(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+    error_message: &str,
+) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table_name})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if columns.iter().any(|column| column == column_name) {
+        Ok(())
+    } else {
+        bail!("{error_message}")
+    }
+}
+
+fn emit_report(
+    report: &ReportData,
+    summary: &ReportSummary,
+    output_path: Option<&Path>,
+) -> Result<()> {
+    if let Some(output_path) = output_path {
+        write_text_file(
+            output_path,
+            &render_report(report, summary, ReportDetail::FullFile),
+        )?;
+        print!("{}", render_summary(report, summary, Some(output_path)));
+    } else {
+        print!(
+            "{}",
+            render_report(report, summary, ReportDetail::CompactStdout)
+        );
+    }
+
+    Ok(())
+}
+
+fn write_text_file(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn render_report(report: &ReportData, summary: &ReportSummary, detail: ReportDetail) -> String {
+    let mut out = String::new();
+
+    out.push_str("# dump-json-refs report\n\n");
+    push_schemas_section(&mut out, report);
+
+    match detail {
+        ReportDetail::CompactStdout => {
+            push_fields_section(&mut out, report);
+            push_schema_aliases_section_if_non_empty(&mut out, report);
+        }
+        ReportDetail::FullFile => {
+            push_schema_object_paths_section(&mut out, report);
+            push_schema_array_index_refs_section(&mut out, report);
+            push_fields_section(&mut out, report);
+        }
+    }
+
+    out.push_str(&render_summary(report, summary, None));
+    out
+}
+
+fn push_schemas_section(out: &mut String, report: &ReportData) {
+    out.push_str("[schemas]\n");
+    out.push_str("schema_path\tschema_kind\tobject_count\n");
+    for schema in &report.schemas {
+        out.push_str(&format!(
+            "{}\t{}\t{}\n",
+            schema.schema_path, schema.schema_kind, schema.object_count
+        ));
+    }
+    out.push('\n');
+}
+
+fn push_schema_object_paths_section(out: &mut String, report: &ReportData) {
+    out.push_str("[schema_object_paths]\n");
+    out.push_str("schema_path\tobject_path\n");
+    for mapping in &report.object_paths {
+        out.push_str(&format!(
+            "{}\t{}\n",
+            mapping.schema_path, mapping.object_path
+        ));
+    }
+    out.push('\n');
+}
+
+fn push_schema_aliases_section_if_non_empty(out: &mut String, report: &ReportData) {
+    let aliases = report
+        .object_paths
+        .iter()
+        .filter(|mapping| mapping.schema_path != mapping.object_path)
+        .collect::<Vec<_>>();
+
+    if aliases.is_empty() {
+        return;
+    }
+
+    out.push_str("[schema_aliases]\n");
+    out.push_str("schema_path\tobject_path\n");
+    for mapping in aliases {
+        out.push_str(&format!(
+            "{}\t{}\n",
+            mapping.schema_path, mapping.object_path
+        ));
+    }
+    out.push('\n');
+}
+
+fn push_schema_array_index_refs_section(out: &mut String, report: &ReportData) {
+    out.push_str("[schema_array_index_refs]\n");
+    out.push_str("schema_path\tarray_path\tarray_index_path\n");
+    for mapping in &report.array_index_refs {
+        out.push_str(&format!(
+            "{}\t{}\t{}\n",
+            mapping.schema_path, mapping.array_path, mapping.array_index_path
+        ));
+    }
+    out.push('\n');
+}
+
+fn push_fields_section(out: &mut String, report: &ReportData) {
+    out.push_str("[fields]\n");
+    out.push_str("schema_path\tfield_name\tfield_type\tfield_count\n");
+    for field in &report.fields {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            field.schema_path, field.field_name, field.field_type, field.field_count
+        ));
+    }
+    out.push('\n');
+}
+
+fn render_summary(
+    report: &ReportData,
+    summary: &ReportSummary,
+    output_path: Option<&Path>,
+) -> String {
+    let mut out = String::new();
+
+    out.push_str("[summary]\n");
+    out.push_str(&format!("schema_count\t{}\n", report.schemas.len()));
+    out.push_str(&format!("field_count\t{}\n", report.fields.len()));
+    out.push_str(&format!(
+        "object_path_mapping_count\t{}\n",
+        report.object_paths.len()
+    ));
+    out.push_str(&format!(
+        "schema_alias_count\t{}\n",
+        report
+            .object_paths
+            .iter()
+            .filter(|mapping| mapping.schema_path != mapping.object_path)
+            .count()
+    ));
+    out.push_str(&format!(
+        "array_index_ref_count\t{}\n",
+        report.array_index_refs.len()
+    ));
+
+    match summary {
+        ReportSummary::Generated {
+            execution_time_ms,
+            input_source,
+        } => {
+            out.push_str(&format!("execution_time_ms\t{execution_time_ms}\n"));
+            out.push_str(&format!("input\t{input_source}\n"));
+        }
+        ReportSummary::FromSqlite { sqlite_path } => {
+            out.push_str(&format!("sqlite_path\t{sqlite_path}\n"));
+        }
+    }
+
+    if let Some(output_path) = output_path {
+        out.push_str(&format!("report\t{}\n", output_path.display()));
+    }
+
+    out
 }
 
 fn write_files_and_index(
@@ -755,11 +1176,20 @@ fn write_files_and_index(
     tx.execute_batch(
         "CREATE TABLE schema_paths (schema_path TEXT NOT NULL, object_path TEXT PRIMARY KEY);
          CREATE TABLE array_index_refs (array_path TEXT NOT NULL, array_index_path TEXT NOT NULL, schema_path TEXT NOT NULL, PRIMARY KEY (array_path, array_index_path));
+         CREATE TABLE schema_definitions (schema_path TEXT PRIMARY KEY, schema_kind TEXT NOT NULL, schema_json TEXT NOT NULL);
          CREATE TABLE schema_object_counts (schema_path TEXT PRIMARY KEY, object_count INTEGER NOT NULL CHECK (object_count > 0));
-         CREATE TABLE schema_field_counts (schema_path TEXT NOT NULL, field_name TEXT NOT NULL, field_count INTEGER NOT NULL CHECK (field_count > 0), PRIMARY KEY (schema_path, field_name));",
+         CREATE TABLE schema_field_counts (schema_path TEXT NOT NULL, field_name TEXT NOT NULL, field_type TEXT NOT NULL, field_count INTEGER NOT NULL CHECK (field_count > 0), PRIMARY KEY (schema_path, field_name));",
     )?;
 
     for record in records {
+        let schema_kind = schema_kind(&record.schema);
+        let schema_json = serde_json::to_string(&record.schema)?;
+        tx.execute(
+            "INSERT INTO schema_definitions(schema_path, schema_kind, schema_json) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(schema_path) DO UPDATE SET schema_kind=excluded.schema_kind, schema_json=excluded.schema_json",
+            params![&record.schema_path, schema_kind, schema_json],
+        )?;
+
         for object_path in &record.object_paths {
             tx.execute(
                 "INSERT INTO schema_paths(schema_path, object_path) VALUES (?1, ?2) \
@@ -779,28 +1209,68 @@ fn write_files_and_index(
             }
         }
     }
-    write_occurrence_statistics(&tx, outdir, occurrences)?;
+    write_occurrence_statistics(&tx, outdir, records, occurrences)?;
     tx.commit()?;
     Ok(())
+}
+
+fn schema_kind(schema: &Value) -> &'static str {
+    match schema.as_object() {
+        Some(map) if is_refs_mut_schema(map) => "heterogeneous",
+        _ => "object",
+    }
+}
+
+fn is_refs_mut_schema(schema: &Map<String, Value>) -> bool {
+    schema.len() == 1 && schema.get("$refs_mut").and_then(Value::as_str).is_some()
 }
 
 fn write_occurrence_statistics(
     tx: &Transaction<'_>,
     outdir: &Path,
+    records: &[Record],
     occurrences: &[Occurrence],
 ) -> Result<()> {
+    let schemas_by_path = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .schema
+                .as_object()
+                .map(|schema| (record.schema_path.as_str(), schema))
+        })
+        .collect::<HashMap<_, _>>();
+
     for occurrence in occurrences {
         let schema_path = canonical_schema_path_for_occurrence(tx, outdir, occurrence)?;
+        let schema = schemas_by_path
+            .get(schema_path.as_str())
+            .with_context(|| format!("missing in-memory schema for {schema_path}"))?;
+
+        if is_refs_mut_schema(schema) {
+            continue;
+        }
+
         tx.execute(
             "INSERT INTO schema_object_counts(schema_path, object_count) VALUES (?1, 1) \
              ON CONFLICT(schema_path) DO UPDATE SET object_count = schema_object_counts.object_count + 1",
             params![&schema_path],
         )?;
+
         for field_name in occurrence.value.keys() {
+            let field_type = schema
+                .get(field_name)
+                .and_then(Value::as_str)
+                .with_context(|| {
+                    format!("missing field type for {schema_path}.{field_name} in canonical schema")
+                })?;
+
             tx.execute(
-                "INSERT INTO schema_field_counts(schema_path, field_name, field_count) VALUES (?1, ?2, 1) \
-                 ON CONFLICT(schema_path, field_name) DO UPDATE SET field_count = schema_field_counts.field_count + 1",
-                params![&schema_path, field_name],
+                "INSERT INTO schema_field_counts(schema_path, field_name, field_type, field_count) VALUES (?1, ?2, ?3, 1) \
+                 ON CONFLICT(schema_path, field_name) DO UPDATE SET \
+                 field_type = excluded.field_type, \
+                 field_count = schema_field_counts.field_count + 1",
+                params![&schema_path, field_name, field_type],
             )?;
         }
     }
@@ -1306,6 +1776,318 @@ mod tests {
 
         assert_eq!(written, "{\"id\":\"number\",\"name\":\"string\"}\n");
 
+        fs::remove_dir_all(outdir).unwrap();
+    }
+
+    #[test]
+    fn stdin_style_input_falls_back_to_jsonl_when_later_record_has_nul_padding() {
+        let entries = normalize_input(
+            "{\"kind\":\"snapshot\"}\n\0\0{\"kind\":\"event\"}\n",
+            false,
+            false,
+            "root",
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, vec!["root_item"]);
+        assert_eq!(entries[0].index, Some(0));
+        assert_eq!(entries[1].index, Some(1));
+    }
+
+    #[test]
+    fn sqlite_stores_field_types_from_canonical_schema() {
+        let outdir = temp_outdir("field-types");
+        let build = build_schema_output(
+            &outdir,
+            vec![Entry {
+                path: vec!["root".to_string()],
+                index: None,
+                collection: false,
+                value: object(json!({
+                    "id": 1,
+                    "optional": null,
+                    "items": [{"kind": "a"}, {"kind": "b"}]
+                })),
+            }],
+        )
+        .unwrap();
+        write_files_and_index(&outdir, &build.records, &build.occurrences, false).unwrap();
+
+        let conn = Connection::open(outdir.join("schemas.sqlite")).unwrap();
+        let root_path = format!("{}/root.json", outdir.display());
+        let item_path = format!("{}/root/items.json", outdir.display());
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT field_type FROM schema_field_counts WHERE schema_path = ?1 AND field_name = 'items'",
+                [&root_path],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            format!("array({item_path})")
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT field_type FROM schema_field_counts WHERE schema_path = ?1 AND field_name = 'kind'",
+                [&item_path],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "string".to_string()
+        );
+
+        drop(conn);
+        fs::remove_dir_all(outdir).unwrap();
+    }
+
+    #[test]
+    fn report_fields_are_sorted_by_count_desc_and_include_field_type() {
+        let report = ReportData {
+            schemas: vec![SchemaCount {
+                schema_path: "refs/root.json".to_string(),
+                schema_kind: "object".to_string(),
+                object_count: 2,
+            }],
+            object_paths: vec![SchemaObjectPath {
+                schema_path: "refs/root.json".to_string(),
+                object_path: "refs/root.json".to_string(),
+            }],
+            array_index_refs: Vec::new(),
+            fields: vec![
+                FieldCount {
+                    schema_path: "refs/root.json".to_string(),
+                    field_name: "frequent".to_string(),
+                    field_type: "string".to_string(),
+                    field_count: 10,
+                },
+                FieldCount {
+                    schema_path: "refs/root.json".to_string(),
+                    field_name: "rare".to_string(),
+                    field_type: "boolean?".to_string(),
+                    field_count: 1,
+                },
+            ],
+        };
+
+        let rendered = render_report(
+            &report,
+            &ReportSummary::Generated {
+                execution_time_ms: 12,
+                input_source: "stdin".to_string(),
+            },
+            ReportDetail::CompactStdout,
+        );
+
+        assert!(rendered.contains("schema_path\tfield_name\tfield_type\tfield_count\n"));
+        assert!(rendered.contains("refs/root.json\tfrequent\tstring\t10\n"));
+        assert!(rendered.contains("refs/root.json\trare\tboolean?\t1\n"));
+        assert!(!rendered.contains("[schema_array_index_refs]"));
+        assert!(!rendered.contains("[schema_object_paths]"));
+    }
+
+    #[test]
+    fn full_file_report_includes_object_paths_and_array_index_refs() {
+        let report = ReportData {
+            schemas: vec![SchemaCount {
+                schema_path: "refs/root_item.json".to_string(),
+                schema_kind: "object".to_string(),
+                object_count: 2,
+            }],
+            object_paths: vec![
+                SchemaObjectPath {
+                    schema_path: "refs/root_item.json".to_string(),
+                    object_path: "refs/root_item.json".to_string(),
+                },
+                SchemaObjectPath {
+                    schema_path: "refs/root_item.json".to_string(),
+                    object_path: "refs/alias.json".to_string(),
+                },
+            ],
+            array_index_refs: vec![SchemaArrayIndexRef {
+                schema_path: "refs/root_item.json".to_string(),
+                array_path: "refs/root_item.json".to_string(),
+                array_index_path: "[0]".to_string(),
+            }],
+            fields: Vec::new(),
+        };
+
+        let compact = render_report(
+            &report,
+            &ReportSummary::FromSqlite {
+                sqlite_path: "refs/schemas.sqlite".to_string(),
+            },
+            ReportDetail::CompactStdout,
+        );
+        assert!(compact.contains("[schema_aliases]\n"));
+        assert!(compact.contains("refs/root_item.json\trefs/alias.json\n"));
+        assert!(!compact.contains("[schema_object_paths]"));
+        assert!(!compact.contains("[schema_array_index_refs]"));
+
+        let full = render_report(
+            &report,
+            &ReportSummary::FromSqlite {
+                sqlite_path: "refs/schemas.sqlite".to_string(),
+            },
+            ReportDetail::FullFile,
+        );
+        assert!(full.contains("[schema_object_paths]\n"));
+        assert!(full.contains("[schema_array_index_refs]\n"));
+        assert!(full.contains("refs/root_item.json\trefs/root_item.json\t[0]\n"));
+    }
+
+    #[test]
+    fn report_data_orders_schemas_by_object_count_and_groups_fields_by_schema_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_paths (schema_path TEXT NOT NULL, object_path TEXT PRIMARY KEY);
+             CREATE TABLE array_index_refs (array_path TEXT NOT NULL, array_index_path TEXT NOT NULL, schema_path TEXT NOT NULL, PRIMARY KEY (array_path, array_index_path));
+             CREATE TABLE schema_definitions (schema_path TEXT PRIMARY KEY, schema_kind TEXT NOT NULL, schema_json TEXT NOT NULL);
+             CREATE TABLE schema_object_counts (schema_path TEXT PRIMARY KEY, object_count INTEGER NOT NULL CHECK (object_count > 0));
+             CREATE TABLE schema_field_counts (schema_path TEXT NOT NULL, field_name TEXT NOT NULL, field_type TEXT NOT NULL, field_count INTEGER NOT NULL CHECK (field_count > 0), PRIMARY KEY (schema_path, field_name));"
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO schema_paths(schema_path, object_path) VALUES (?1, ?2)",
+            ["refs/high.json", "refs/high.json"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_paths(schema_path, object_path) VALUES (?1, ?2)",
+            ["refs/low.json", "refs/low.json"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_paths(schema_path, object_path) VALUES (?1, ?2)",
+            ["refs/container.json", "refs/container.json"],
+        )
+        .unwrap();
+
+        for (schema_path, schema_kind) in [
+            ("refs/high.json", "object"),
+            ("refs/low.json", "object"),
+            ("refs/container.json", "heterogeneous"),
+        ] {
+            conn.execute(
+                "INSERT INTO schema_definitions(schema_path, schema_kind, schema_json) VALUES (?1, ?2, '{}')",
+                params![schema_path, schema_kind],
+            )
+            .unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO schema_object_counts(schema_path, object_count) VALUES (?1, ?2)",
+            params!["refs/high.json", 100],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_object_counts(schema_path, object_count) VALUES (?1, ?2)",
+            params!["refs/low.json", 50],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO schema_field_counts(schema_path, field_name, field_type, field_count) VALUES (?1, ?2, ?3, ?4)",
+            params!["refs/high.json", "rare", "string", 1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_field_counts(schema_path, field_name, field_type, field_count) VALUES (?1, ?2, ?3, ?4)",
+            params!["refs/high.json", "common", "number", 90],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_field_counts(schema_path, field_name, field_type, field_count) VALUES (?1, ?2, ?3, ?4)",
+            params!["refs/low.json", "very_common", "boolean", 999],
+        )
+        .unwrap();
+
+        let report = read_report_data(&conn).unwrap();
+        assert_eq!(
+            report
+                .schemas
+                .iter()
+                .map(|schema| schema.schema_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["refs/high.json", "refs/low.json", "refs/container.json"]
+        );
+        assert_eq!(
+            report
+                .fields
+                .iter()
+                .map(|field| (
+                    field.schema_path.as_str(),
+                    field.field_name.as_str(),
+                    field.field_count
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("refs/high.json", "common", 90),
+                ("refs/high.json", "rare", 1),
+                ("refs/low.json", "very_common", 999),
+            ]
+        );
+    }
+
+    #[test]
+    fn refs_mut_schemas_are_marked_heterogeneous_and_skipped_for_statistics() {
+        let outdir = temp_outdir("refs-mut-kind");
+        let build = build_schema_output(
+            &outdir,
+            vec![Entry {
+                path: vec!["root".to_string()],
+                index: None,
+                collection: false,
+                value: object(json!({
+                    "items": [{"kind": "a"}, {"other": "b"}]
+                })),
+            }],
+        )
+        .unwrap();
+        write_files_and_index(&outdir, &build.records, &build.occurrences, false).unwrap();
+
+        let conn = Connection::open(outdir.join("schemas.sqlite")).unwrap();
+        let container_path = format!("{}/root/items.json", outdir.display());
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT schema_kind FROM schema_definitions WHERE schema_path = ?1",
+                [&container_path],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "heterogeneous"
+        );
+
+        let object_count_rows = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_object_counts WHERE schema_path = ?1",
+                [&container_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(object_count_rows, 0);
+
+        let field_count_rows = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_field_counts WHERE schema_path = ?1",
+                [&container_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(field_count_rows, 0);
+
+        let report = load_report_from_sqlite(&outdir.join("schemas.sqlite")).unwrap();
+        let rendered = render_report(
+            &report,
+            &ReportSummary::FromSqlite {
+                sqlite_path: outdir.join("schemas.sqlite").display().to_string(),
+            },
+            ReportDetail::CompactStdout,
+        );
+        assert!(rendered.contains(&format!("{container_path}\theterogeneous\t0\n")));
+
+        drop(conn);
         fs::remove_dir_all(outdir).unwrap();
     }
 }
