@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "dump-json-refs")]
-#[command(
-    about = "Generate compact JSON schema refs and a SQLite path index from JSON/JSONL input"
-)]
+#[command(about = "Generate JSON schema refs and a SQLite path index from JSON/JSONL input")]
 struct Args {
     /// Force JSONL mode. Without this flag, *.jsonl input files are also treated as JSONL.
     #[arg(long)]
     jsonl: bool,
+
+    /// Output compact one-line JSON files under the refs directory.
+    #[arg(short = 'c', long = "compact-output")]
+    compact_output: bool,
 
     /// Output directory. It is removed and recreated.
     #[arg(long, default_value = "refs")]
@@ -87,7 +89,12 @@ fn run(args: Args) -> Result<()> {
         .with_context(|| format!("failed to create {}", args.outdir.display()))?;
 
     write_records(&build.records)?;
-    write_files_and_index(&args.outdir, &build.records, &build.occurrences)?;
+    write_files_and_index(
+        &args.outdir,
+        &build.records,
+        &build.occurrences,
+        args.compact_output,
+    )?;
     Ok(())
 }
 
@@ -715,17 +722,21 @@ fn write_files_and_index(
     outdir: &Path,
     records: &[Record],
     occurrences: &[Occurrence],
+    compact_output: bool,
 ) -> Result<()> {
     let mut made_dirs = HashMap::<PathBuf, ()>::new();
 
     for record in records {
         let canonical = PathBuf::from(&record.schema_path);
         ensure_parent(&canonical, &mut made_dirs)?;
-        fs::write(
-            &canonical,
-            format!("{}\n", serde_json::to_string(&record.schema)?),
-        )
-        .with_context(|| format!("failed to write {}", canonical.display()))?;
+        let schema_json = if compact_output {
+            serde_json::to_string(&record.schema)?
+        } else {
+            serde_json::to_string_pretty(&record.schema)?
+        };
+
+        fs::write(&canonical, format!("{schema_json}\n"))
+            .with_context(|| format!("failed to write {}", canonical.display()))?;
 
         for object_path in &record.object_paths {
             if object_path == &record.schema_path {
@@ -1048,7 +1059,7 @@ mod tests {
             ],
         )
         .unwrap();
-        write_files_and_index(&outdir, &build.records, &build.occurrences).unwrap();
+        write_files_and_index(&outdir, &build.records, &build.occurrences, false).unwrap();
 
         let conn = Connection::open(outdir.join("schemas.sqlite")).unwrap();
         let mut stmt = conn
@@ -1090,7 +1101,7 @@ mod tests {
             }],
         )
         .unwrap();
-        write_files_and_index(&outdir, &build.records, &build.occurrences).unwrap();
+        write_files_and_index(&outdir, &build.records, &build.occurrences, false).unwrap();
 
         let conn = Connection::open(outdir.join("schemas.sqlite")).unwrap();
         let meta_path = format!("{}/root/items/meta.json", outdir.display());
@@ -1153,7 +1164,7 @@ mod tests {
             }],
         )
         .unwrap();
-        write_files_and_index(&outdir, &build.records, &build.occurrences).unwrap();
+        write_files_and_index(&outdir, &build.records, &build.occurrences, false).unwrap();
 
         let conn = Connection::open(outdir.join("schemas.sqlite")).unwrap();
         let container_path = format!("{}/root/items.json", outdir.display());
@@ -1191,7 +1202,7 @@ mod tests {
             ],
         )
         .unwrap();
-        write_files_and_index(&outdir, &build.records, &build.occurrences).unwrap();
+        write_files_and_index(&outdir, &build.records, &build.occurrences, false).unwrap();
 
         let conn = Connection::open(outdir.join("schemas.sqlite")).unwrap();
         let root_path = format!("{}/root_item.json", outdir.display());
@@ -1235,5 +1246,66 @@ mod tests {
         let mut command = Args::command();
         let help = command.render_help().to_string();
         assert!(!help.contains("--jqfile"));
+    }
+    #[test]
+    fn writes_pretty_json_files_by_default() {
+        let outdir = temp_outdir("pretty-json-output");
+        let build = build_schema_output(
+            &outdir,
+            vec![Entry {
+                path: vec!["root".to_string()],
+                index: None,
+                collection: false,
+                value: object(json!({
+                    "id": 1,
+                    "name": "example"
+                })),
+            }],
+        )
+        .unwrap();
+
+        write_files_and_index(&outdir, &build.records, &build.occurrences, false).unwrap();
+
+        let schema_path = outdir.join("root.json");
+        let written = fs::read_to_string(&schema_path).unwrap();
+
+        assert!(written.contains('\n'));
+        assert!(written.contains("  \"id\""));
+        assert_eq!(
+            serde_json::from_str::<Value>(&written).unwrap(),
+            json!({
+                "id": "number",
+                "name": "string"
+            })
+        );
+
+        fs::remove_dir_all(outdir).unwrap();
+    }
+
+    #[test]
+    fn writes_compact_json_files_with_compact_output_flag() {
+        let outdir = temp_outdir("compact-json-output");
+        let build = build_schema_output(
+            &outdir,
+            vec![Entry {
+                path: vec!["root".to_string()],
+                index: None,
+                collection: false,
+                value: object(json!({
+                    "id": 1,
+                    "name": "example"
+                })),
+            }],
+        )
+        .unwrap();
+
+        write_files_and_index(&outdir, &build.records, &build.occurrences, true).unwrap();
+
+        let schema_path = outdir.join("root.json");
+        let written = fs::read_to_string(&schema_path).unwrap();
+
+        assert_eq!(written, "{\"id\":\"number\",\"name\":\"string\"}\n");
+
+        fs::remove_dir_all(outdir).unwrap();
     }
 }
