@@ -9,7 +9,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
-#[command(name = "json-refs")]
+#[command(name = "dump-json-refs")]
 #[command(
     about = "Generate compact JSON schema refs and a SQLite path index from JSON/JSONL input"
 )]
@@ -1230,7 +1230,7 @@ mod tests {
 
     #[test]
     fn jqfile_is_not_a_supported_cli_option_or_help_entry() {
-        assert!(Args::try_parse_from(["json-refs", "--jqfile", "schema.jq"]).is_err());
+        assert!(Args::try_parse_from(["dump-json-refs", "--jqfile", "schema.jq"]).is_err());
 
         let mut command = Args::command();
         let help = command.render_help().to_string();
