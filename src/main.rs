@@ -58,8 +58,8 @@ struct Args {
     /// Generate a graph projection from SQLite schema relations.
     ///
     /// When FILE is omitted, the default path depends on --graph-format:
-    /// mermaid -> <outdir>/schema.mmd, mermaid-md -> <outdir>/schema.md,
-    /// dot -> <outdir>/schema.dot. In --from-sqlite mode, <outdir> is
+    /// mermaid -> `<outdir>/schema.mmd`, mermaid-md -> `<outdir>/schema.md`,
+    /// dot -> `<outdir>/schema.dot`. In --from-sqlite mode, `<outdir>` is
     /// replaced by the SQLite file's parent directory. Existing refs are not
     /// removed in --from-sqlite mode.
     #[arg(
