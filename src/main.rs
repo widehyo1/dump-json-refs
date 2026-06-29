@@ -1092,8 +1092,112 @@ struct StreamAcc {
     object_field_facts: HashMap<(String, String), ObjectFieldAggregate>,
     array_member_facts: HashMap<(String, usize), ArrayMemberAggregate>,
     item_schema_counts: HashMap<(String, String, String), ItemSchemaCountAggregate>,
-    item_schema_index_refs: HashMap<(String, String, String), ItemSchemaIndexRefAggregate>,
+    item_schema_index_refs: HashMap<ItemSchemaIndexRefKey, ItemSchemaIndexRefAggregate>,
     item_schema_field_counts: HashMap<(String, String, String, String), i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ItemSchemaIndexRefKey {
+    role: String,
+    path_base: String,
+    index_path: CompactIndexPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum CompactIndexPath {
+    One(usize),
+    Two(usize, usize),
+    Three(usize, usize, usize),
+    Many(Vec<usize>),
+}
+
+impl CompactIndexPath {
+    fn from_slice(index_path: &[usize]) -> Self {
+        match index_path {
+            [a] => Self::One(*a),
+            [a, b] => Self::Two(*a, *b),
+            [a, b, c] => Self::Three(*a, *b, *c),
+            _ => Self::Many(index_path.to_vec()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Two(_, _) => 2,
+            Self::Three(_, _, _) => 3,
+            Self::Many(indexes) => indexes.len(),
+        }
+    }
+
+    fn write_json_string(&self, out: &mut String) {
+        out.clear();
+        out.push('[');
+        self.write_csv(out);
+        out.push(']');
+    }
+
+    fn write_sort_key(&self, out: &mut String) {
+        out.clear();
+        self.write_padded_csv(out);
+    }
+
+    fn write_csv(&self, out: &mut String) {
+        match self {
+            Self::One(a) => out.push_str(&a.to_string()),
+            Self::Two(a, b) => {
+                out.push_str(&a.to_string());
+                out.push(',');
+                out.push_str(&b.to_string());
+            }
+            Self::Three(a, b, c) => {
+                out.push_str(&a.to_string());
+                out.push(',');
+                out.push_str(&b.to_string());
+                out.push(',');
+                out.push_str(&c.to_string());
+            }
+            Self::Many(indexes) => {
+                for (idx, index) in indexes.iter().enumerate() {
+                    if idx > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&index.to_string());
+                }
+            }
+        }
+    }
+
+    fn write_padded_csv(&self, out: &mut String) {
+        match self {
+            Self::One(a) => push_padded_index(out, *a),
+            Self::Two(a, b) => {
+                push_padded_index(out, *a);
+                out.push('/');
+                push_padded_index(out, *b);
+            }
+            Self::Three(a, b, c) => {
+                push_padded_index(out, *a);
+                out.push('/');
+                push_padded_index(out, *b);
+                out.push('/');
+                push_padded_index(out, *c);
+            }
+            Self::Many(indexes) => {
+                for (idx, index) in indexes.iter().enumerate() {
+                    if idx > 0 {
+                        out.push('/');
+                    }
+                    push_padded_index(out, *index);
+                }
+            }
+        }
+    }
+}
+
+fn push_padded_index(out: &mut String, index: usize) {
+    use std::fmt::Write as _;
+    let _ = write!(out, "{index:020}");
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1178,16 +1282,15 @@ impl StreamAcc {
                 });
         count.object_count += 1;
 
-        let array_index_path = serde_json::to_string(array_indexes)?;
+        let index_ref_key = ItemSchemaIndexRefKey {
+            role: role_name.clone(),
+            path_base: path_base.clone(),
+            index_path: CompactIndexPath::from_slice(array_indexes),
+        };
         self.item_schema_index_refs.insert(
-            (
-                role_name.clone(),
-                path_base.clone(),
-                array_index_path.clone(),
-            ),
+            index_ref_key,
             ItemSchemaIndexRefAggregate {
                 canonical_json: canonical_json.clone(),
-                index_path_key: index_path_sort_key(array_indexes),
             },
         );
 
@@ -1332,26 +1435,61 @@ impl StreamAcc {
         let section_started = Instant::now();
         let mut item_schema_index_refs =
             self.item_schema_index_refs.into_iter().collect::<Vec<_>>();
-        item_schema_index_refs.sort_by(|a, b| a.0.cmp(&b.0));
         let item_schema_index_refs_len = item_schema_index_refs.len();
-        for ((role, path_base, array_index_path), aggregate) in item_schema_index_refs {
-            tx.execute(
-                "INSERT INTO stream_item_schema_index_refs(
-                     role, path_base, canonical_json, array_index_path, index_path_key
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(role, path_base, array_index_path) DO UPDATE SET
-                     canonical_json = excluded.canonical_json,
-                     index_path_key = excluded.index_path_key",
-                params![
-                    role,
-                    path_base,
-                    aggregate.canonical_json,
-                    array_index_path,
-                    aggregate.index_path_key,
-                ],
-            )?;
+        let sort_started = Instant::now();
+        item_schema_index_refs.sort_by(|a, b| a.0.cmp(&b.0));
+        perf_trace_detail(
+            "stream.flush.item_schema_index_refs.sort",
+            sort_started,
+            format_args!("rows={item_schema_index_refs_len}"),
+        );
+
+        let insert_started = Instant::now();
+        let mut compact_len_one = 0usize;
+        let mut compact_len_two = 0usize;
+        let mut compact_len_three = 0usize;
+        let mut compact_len_many = 0usize;
+        let mut total_index_depth = 0usize;
+        let mut max_index_depth = 0usize;
+        let mut array_index_path = String::new();
+        let mut index_path_key = String::new();
+        let mut stmt = tx.prepare(
+            "INSERT INTO stream_item_schema_index_refs(
+                 role, path_base, canonical_json, array_index_path, index_path_key
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(role, path_base, array_index_path) DO UPDATE SET
+                 canonical_json = excluded.canonical_json,
+                 index_path_key = excluded.index_path_key",
+        )?;
+        for (key, aggregate) in item_schema_index_refs {
+            let index_depth = key.index_path.len();
+            total_index_depth += index_depth;
+            max_index_depth = max_index_depth.max(index_depth);
+            match index_depth {
+                1 => compact_len_one += 1,
+                2 => compact_len_two += 1,
+                3 => compact_len_three += 1,
+                _ => compact_len_many += 1,
+            }
+            key.index_path.write_json_string(&mut array_index_path);
+            key.index_path.write_sort_key(&mut index_path_key);
+            stmt.execute(params![
+                key.role,
+                key.path_base,
+                aggregate.canonical_json,
+                &array_index_path,
+                &index_path_key,
+            ])?;
         }
+        drop(stmt);
+        perf_trace_detail(
+            "stream.flush.item_schema_index_refs.insert",
+            insert_started,
+            format_args!(
+                "rows={item_schema_index_refs_len}	len1={compact_len_one}	len2={compact_len_two}	len3={compact_len_three}	len_many={compact_len_many}	total_index_depth={total_index_depth}	max_index_depth={max_index_depth}"
+            ),
+        );
         perf_trace_detail(
             "stream.flush.item_schema_index_refs",
             section_started,
@@ -1408,7 +1546,6 @@ struct ItemSchemaCountAggregate {
 #[derive(Debug)]
 struct ItemSchemaIndexRefAggregate {
     canonical_json: String,
-    index_path_key: String,
 }
 
 fn record_streamed_object_occurrence_to_acc(
@@ -2079,7 +2216,10 @@ fn insert_streamed_array_index_refs_for_item_schema(
 ) -> Result<()> {
     let stage_started = Instant::now();
     let inserted = tx.execute(
-        "INSERT OR REPLACE INTO array_index_refs(array_path, array_index_path, schema_path)          SELECT ?1, array_index_path, ?2          FROM stream_item_schema_index_refs          WHERE role = ?3 AND path_base = ?4 AND canonical_json = ?5",
+        "INSERT OR REPLACE INTO array_index_refs(array_path, array_index_path, schema_path)
+         SELECT ?1, array_index_path, ?2
+         FROM stream_item_schema_index_refs
+         WHERE role = ?3 AND path_base = ?4 AND canonical_json = ?5",
         params![array_path, schema_path, role_name, path_base, canonical],
     )?;
     perf_trace_detail(
@@ -3116,7 +3256,10 @@ fn write_schema_array_index_refs_section_from_sqlite<W: Write>(
     writeln!(writer, "schema_path	array_path	array_index_path")?;
     let query_started = Instant::now();
     let mut stmt = conn.prepare(&format!(
-        "SELECT r.schema_path, r.array_path, r.array_index_path          FROM array_index_refs AS r          JOIN ({}) AS schema_order ON schema_order.schema_path = r.schema_path          ORDER BY schema_order.object_count DESC, r.schema_path, r.array_path, r.array_index_path",
+        "SELECT r.schema_path, r.array_path, r.array_index_path
+         FROM array_index_refs AS r
+         JOIN ({}) AS schema_order ON schema_order.schema_path = r.schema_path
+         ORDER BY schema_order.object_count DESC, r.schema_path, r.array_path, r.array_index_path",
         schema_order_sql()
     ))?;
     let mut rows = stmt.query([])?;
