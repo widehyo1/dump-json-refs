@@ -34,6 +34,13 @@ dump-json-refs --outdir refs --graph input.json
 dump-json-refs --from-sqlite refs/schemas.sqlite --graph-format mermaid-md
 ```
 
+## Large JSONL inputs
+
+For JSONL input, `dump-json-refs` streams records instead of loading the whole
+file into memory. This keeps large JSONL extraction practical while preserving
+the same schema, field count, object path, alias, and array index reference
+semantics as normal JSONL processing.
+
 ## Output
 
 The command removes and recreates the output directory, then creates:
@@ -150,7 +157,9 @@ CREATE TABLE schema_relations (
 - A field observed both as an array and as a scalar preserves both shapes, for example `array(<path>.json)|string`.
 - Object arrays use one `<array_path>.json` when homogeneous. Heterogeneous object arrays use `<array_path>.json` containing `{ "$refs_mut": "<array_path>/" }`, with distinct schemas stored as `<array_path>/<index_path>.json`.
 - `array_index_refs.array_index_path` is a JSON array of every enclosing array position; `[1,0]` identifies the first nested item inside the second outer item.
-- JSONL input ignores raw NUL padding only at the start of a physical record; other malformed JSON remains an error that identifies its line.
+- JSONL input ignores raw NUL padding only at the start of a physical record.
+- An incomplete trailing JSONL record may be ignored to tolerate partially written files.
+- Other malformed JSON remains an error that identifies its line.
 - Top-level collection:
   - homogeneous: one `<root_collection>.json`
   - heterogeneous: distinct `<root_collection>/<first_index>.json` files only

@@ -1,6 +1,6 @@
 [package]
 name = "dump-json-refs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Extract canonical JSON/JSONL schemas and SQLite metadata for database reverse engineering."
 repository = "https://github.com/widehyo1/dump-json-refs"
