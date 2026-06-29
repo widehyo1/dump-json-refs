@@ -202,6 +202,37 @@ fn sqlite_table_count(tx: &Transaction<'_>, table_name: &str) -> Result<i64> {
         .with_context(|| format!("failed to count {table_name}"))
 }
 
+fn perf_trace_sql_enabled() -> bool {
+    std::env::var_os("DUMP_JSON_REFS_TRACE_SQL").is_some()
+}
+
+fn perf_trace_query_plan(tx: &Transaction<'_>, stage: &str, sql: &str) -> Result<()> {
+    if !perf_trace_sql_enabled() {
+        return Ok(());
+    }
+
+    let started = Instant::now();
+    let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+    let mut stmt = tx
+        .prepare(&explain_sql)
+        .with_context(|| format!("failed to explain query plan for {stage}"))?;
+    let mut rows = stmt.query([])?;
+    let mut row_count = 0usize;
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(0)?;
+        let parent: i64 = row.get(1)?;
+        let detail: String = row.get(3)?;
+        eprintln!("[perf-sql]	stage={stage}	id={id}	parent={parent}	detail={detail}");
+        row_count += 1;
+    }
+    perf_trace_detail(
+        "sql.explain_query_plan",
+        started,
+        format_args!("query_stage={stage}	rows={row_count}"),
+    );
+    Ok(())
+}
+
 fn run(args: Args) -> Result<()> {
     if let Some(sqlite_path) = args.from_sqlite.as_deref() {
         if args.input_file.is_some() {
@@ -2374,34 +2405,123 @@ fn write_streamed_occurrence_statistics(tx: &Transaction<'_>) -> Result<()> {
 }
 
 fn write_schema_relations_from_sqlite(tx: &Transaction<'_>) -> Result<()> {
-    let records = {
-        let mut stmt = tx.prepare(
-            "SELECT d.schema_path, d.schema_json, \
-                    (SELECT MIN(r.array_path) FROM array_index_refs AS r WHERE r.schema_path = d.schema_path) AS array_parent \
-             FROM schema_definitions AS d \
-             ORDER BY d.schema_path",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                let schema_json: String = row.get(1)?;
-                Ok(Record {
-                    schema_path: row.get(0)?,
-                    object_paths: Vec::new(),
-                    schema: serde_json::from_str(&schema_json).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?,
-                    array_parent: row.get(2)?,
-                    array_index_paths: Vec::new(),
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
-    write_schema_relations(tx, &records)
+    if perf_trace_enabled() {
+        let started = Instant::now();
+        perf_trace_detail(
+            "finalize.write_schema_relations.input_counts",
+            started,
+            format_args!(
+                "schema_definitions={}	array_index_refs={}	schema_object_counts={}	schema_field_counts={}",
+                sqlite_table_count(tx, "schema_definitions")?,
+                sqlite_table_count(tx, "array_index_refs")?,
+                sqlite_table_count(tx, "schema_object_counts")?,
+                sqlite_table_count(tx, "schema_field_counts")?,
+            ),
+        );
+    }
+
+    let array_parent_sql = r#"
+SELECT schema_path, MIN(array_path) AS array_parent
+FROM array_index_refs
+GROUP BY schema_path
+"#;
+    perf_trace_query_plan(
+        tx,
+        "finalize.write_schema_relations.load_array_parents",
+        array_parent_sql,
+    )?;
+
+    let parent_started = Instant::now();
+    let mut array_parents = HashMap::<String, String>::new();
+    {
+        let mut stmt = tx
+            .prepare(array_parent_sql)
+            .context("failed to prepare schema relation array parent query")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let schema_path: String = row.get(0)?;
+            let array_parent: Option<String> = row.get(1)?;
+            if let Some(array_parent) = array_parent {
+                array_parents.insert(schema_path, array_parent);
+            }
+        }
+    }
+    perf_trace_detail(
+        "finalize.write_schema_relations.load_array_parents",
+        parent_started,
+        format_args!("parents={}", array_parents.len()),
+    );
+
+    let schema_definitions_sql = r#"
+SELECT schema_path, schema_json
+FROM schema_definitions
+ORDER BY schema_path
+"#;
+    perf_trace_query_plan(
+        tx,
+        "finalize.write_schema_relations.load_schema_definitions",
+        schema_definitions_sql,
+    )?;
+
+    let records_started = Instant::now();
+    let mut records = Vec::new();
+    let mut records_with_array_parent = 0usize;
+    let mut parse_schema_json_ms = 0u128;
+    {
+        let mut stmt = tx
+            .prepare(schema_definitions_sql)
+            .context("failed to prepare schema relation schema definition query")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let schema_path: String = row.get(0)?;
+            let schema_json: String = row.get(1)?;
+            let parse_started = Instant::now();
+            let schema = serde_json::from_str(&schema_json).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+            parse_schema_json_ms += parse_started.elapsed().as_millis();
+
+            let array_parent = array_parents.get(&schema_path).cloned();
+            if array_parent.is_some() {
+                records_with_array_parent += 1;
+            }
+
+            records.push(Record {
+                schema_path,
+                object_paths: Vec::new(),
+                schema,
+                array_parent,
+                array_index_paths: Vec::new(),
+            });
+        }
+    }
+    perf_trace_detail(
+        "finalize.write_schema_relations.load_schema_definitions",
+        records_started,
+        format_args!(
+            "records={}	records_with_array_parent={}	parse_schema_json_ms={}",
+            records.len(),
+            records_with_array_parent,
+            parse_schema_json_ms,
+        ),
+    );
+
+    let build_started = Instant::now();
+    write_schema_relations(tx, &records)?;
+    perf_trace_detail(
+        "finalize.write_schema_relations.build",
+        build_started,
+        format_args!(
+            "records={}	schema_relations={}",
+            records.len(),
+            sqlite_table_count(tx, "schema_relations")?,
+        ),
+    );
+    Ok(())
 }
 
 fn build_schema_output(outdir: &Path, entries: Vec<Entry>) -> Result<SchemaBuild> {
