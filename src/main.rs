@@ -1,12 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -180,9 +180,8 @@ fn run(args: Args) -> Result<()> {
             bail!("input file cannot be used with --from-sqlite");
         }
 
-        let report = load_report_from_sqlite(sqlite_path)?;
-        emit_report(
-            &report,
+        emit_report_from_sqlite(
+            sqlite_path,
             &ReportSummary::FromSqlite {
                 sqlite_path: sqlite_path.display().to_string(),
             },
@@ -216,6 +215,17 @@ fn run(args: Args) -> Result<()> {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "stdin".to_string());
 
+    if let Some(path) = args.input_file.as_ref() {
+        let (base, source_is_jsonl) = input_file_base_and_jsonl(path)?;
+        if args.jsonl || source_is_jsonl {
+            stream_jsonl_file_run(args, input_source, base, started)?;
+            return Ok(());
+        }
+    } else if args.jsonl {
+        stream_jsonl_stdin_run(args, input_source, started)?;
+        return Ok(());
+    }
+
     let (input, file_mode, base, source_is_jsonl) = read_input(&args)?;
     let jsonl_mode = args.jsonl || source_is_jsonl;
     let entries = normalize_input(&input, jsonl_mode, file_mode, &base)?;
@@ -236,9 +246,8 @@ fn run(args: Args) -> Result<()> {
     )?;
 
     let database = args.outdir.join("schemas.sqlite");
-    let report = load_report_from_sqlite(&database)?;
-    emit_report(
-        &report,
+    emit_report_from_sqlite(
+        &database,
         &ReportSummary::Generated {
             execution_time_ms: started.elapsed().as_millis(),
             input_source,
@@ -263,6 +272,95 @@ fn run(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn input_file_base_and_jsonl(path: &Path) -> Result<(String, bool)> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("invalid input path: {}", path.display()))?
+        .to_string_lossy();
+    let source_is_jsonl = file_name.ends_with(".jsonl");
+    let base = file_name
+        .strip_suffix(".jsonl")
+        .or_else(|| file_name.strip_suffix(".json"))
+        .unwrap_or(&file_name)
+        .to_string();
+    Ok((base, source_is_jsonl))
+}
+
+fn stream_jsonl_file_run(
+    args: Args,
+    input_source: String,
+    base: String,
+    started: Instant,
+) -> Result<()> {
+    let input_path = args
+        .input_file
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing JSONL input file"))?;
+    let file = fs::File::open(input_path)
+        .with_context(|| format!("cannot read input file: {}", input_path.display()))?;
+
+    prepare_outdir(&args.outdir)?;
+    stream_jsonl_reader_to_outdir(
+        BufReader::new(file),
+        &args.outdir,
+        true,
+        &base,
+        args.compact_output,
+    )?;
+    finish_generated_run(args, input_source, started)
+}
+
+fn stream_jsonl_stdin_run(args: Args, input_source: String, started: Instant) -> Result<()> {
+    let stdin = io::stdin();
+    prepare_outdir(&args.outdir)?;
+    stream_jsonl_reader_to_outdir(
+        stdin.lock(),
+        &args.outdir,
+        false,
+        "root",
+        args.compact_output,
+    )?;
+    finish_generated_run(args, input_source, started)
+}
+
+fn finish_generated_run(args: Args, input_source: String, started: Instant) -> Result<()> {
+    let database = args.outdir.join("schemas.sqlite");
+    emit_report_from_sqlite(
+        &database,
+        &ReportSummary::Generated {
+            execution_time_ms: started.elapsed().as_millis(),
+            input_source,
+        },
+        args.report_output.as_deref(),
+    )?;
+
+    if let Some(graph_output) = resolve_graph_output_path(
+        args.graph_requested,
+        args.graph_output.as_deref(),
+        &args.outdir,
+        None,
+        args.graph_format,
+    ) {
+        write_graph_from_sqlite(
+            &database,
+            &graph_output,
+            args.graph_include_marked,
+            &args.graph_rankdir,
+            args.graph_format,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn prepare_outdir(outdir: &Path) -> Result<()> {
+    if outdir.exists() {
+        fs::remove_dir_all(outdir)
+            .with_context(|| format!("failed to remove {}", outdir.display()))?;
+    }
+    fs::create_dir_all(outdir).with_context(|| format!("failed to create {}", outdir.display()))
 }
 
 fn reject_unsafe_outdir(outdir: &Path) -> Result<()> {
@@ -434,6 +532,1161 @@ fn parse_jsonl_stream(input: &str) -> Result<Vec<Value>> {
         values.extend(parsed);
     }
     Ok(values)
+}
+
+const STREAM_BATCH_VALUES: usize = 1000;
+
+fn stream_jsonl_reader_to_outdir<R: BufRead>(
+    reader: R,
+    outdir: &Path,
+    file_mode: bool,
+    base: &str,
+    compact_output: bool,
+) -> Result<()> {
+    let database = outdir.join("schemas.sqlite");
+    let mut conn = Connection::open(&database)
+        .with_context(|| format!("failed to open {}", database.display()))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = FILE;",
+    )?;
+    create_stream_tables(&conn)?;
+    stream_jsonl_into_temp_tables(&mut conn, reader, outdir, file_mode, base)?;
+    finalize_streamed_jsonl(&mut conn, outdir, compact_output)
+}
+
+fn create_stream_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE stream_object_totals (
+             path_base TEXT PRIMARY KEY,
+             object_count INTEGER NOT NULL
+         );
+         CREATE TEMP TABLE stream_object_field_facts (
+             path_base TEXT NOT NULL,
+             field_name TEXT NOT NULL,
+             present_count INTEGER NOT NULL,
+             array_count INTEGER NOT NULL,
+             boolean_count INTEGER NOT NULL,
+             null_count INTEGER NOT NULL,
+             number_count INTEGER NOT NULL,
+             object_count INTEGER NOT NULL,
+             string_count INTEGER NOT NULL,
+             PRIMARY KEY (path_base, field_name)
+         );
+         CREATE TEMP TABLE stream_array_member_facts (
+             path_base TEXT NOT NULL,
+             depth INTEGER NOT NULL,
+             member_count INTEGER NOT NULL,
+             array_count INTEGER NOT NULL,
+             boolean_count INTEGER NOT NULL,
+             null_count INTEGER NOT NULL,
+             number_count INTEGER NOT NULL,
+             object_count INTEGER NOT NULL,
+             string_count INTEGER NOT NULL,
+             PRIMARY KEY (path_base, depth)
+         );
+         CREATE TEMP TABLE stream_item_schema_counts (
+             role TEXT NOT NULL,
+             path_base TEXT NOT NULL,
+             canonical_json TEXT NOT NULL,
+             schema_json TEXT NOT NULL,
+             object_count INTEGER NOT NULL,
+             PRIMARY KEY (role, path_base, canonical_json)
+         );
+         CREATE TEMP TABLE stream_item_schema_index_refs (
+             role TEXT NOT NULL,
+             path_base TEXT NOT NULL,
+             canonical_json TEXT NOT NULL,
+             array_index_path TEXT NOT NULL,
+             index_path_key TEXT NOT NULL,
+             PRIMARY KEY (role, path_base, array_index_path)
+         );
+         CREATE TEMP TABLE stream_item_schema_field_counts (
+             role TEXT NOT NULL,
+             path_base TEXT NOT NULL,
+             canonical_json TEXT NOT NULL,
+             field_name TEXT NOT NULL,
+             field_count INTEGER NOT NULL,
+             PRIMARY KEY (role, path_base, canonical_json, field_name)
+         );
+         CREATE TEMP TABLE stream_object_schema_candidates (
+             canonical_json TEXT NOT NULL,
+             schema_json TEXT NOT NULL,
+             object_path TEXT NOT NULL PRIMARY KEY
+         );
+         CREATE TEMP TABLE stream_schema_field_types (
+             schema_path TEXT NOT NULL,
+             field_name TEXT NOT NULL,
+             field_type TEXT NOT NULL,
+             PRIMARY KEY (schema_path, field_name)
+         );
+         CREATE TEMP TABLE stream_item_schema_paths (
+             role TEXT NOT NULL,
+             path_base TEXT NOT NULL,
+             canonical_json TEXT NOT NULL,
+             schema_path TEXT NOT NULL,
+             PRIMARY KEY (role, path_base, canonical_json)
+         );
+         CREATE INDEX stream_item_schema_counts_path ON stream_item_schema_counts(role, path_base);
+         CREATE INDEX stream_item_schema_index_refs_schema ON stream_item_schema_index_refs(role, path_base, canonical_json);
+         CREATE INDEX stream_item_schema_paths_schema ON stream_item_schema_paths(role, path_base, canonical_json);",
+    )?;
+    Ok(())
+}
+
+fn stream_jsonl_into_temp_tables<R: BufRead>(
+    conn: &mut Connection,
+    mut reader: R,
+    outdir: &Path,
+    file_mode: bool,
+    base: &str,
+) -> Result<()> {
+    let root = if file_mode {
+        format!("{base}_ref")
+    } else {
+        "root_item".to_string()
+    };
+    let root_base = reference_path(outdir, &[root]);
+
+    let mut line = String::new();
+    let mut line_number = 0usize;
+    let mut value_index = 0usize;
+    let mut batch_values = 0usize;
+    let mut saw_value = false;
+    let mut tx = conn.transaction()?;
+
+    'records: loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .context("failed to read JSONL input")?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+
+        let record = line.trim_start_matches('\0');
+        if record.trim().is_empty() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            bail!("invalid JSONL input at line {line_number}: record contains only NUL padding");
+        }
+
+        let de = serde_json::Deserializer::from_str(record);
+        for value in de.into_iter::<Value>() {
+            let value = match value {
+                Ok(value) => value,
+                Err(error) if is_incomplete_trailing_jsonl_record(&line, &error) => {
+                    eprintln!(
+                        "warning: skipped incomplete trailing JSONL record at line {line_number}"
+                    );
+                    break 'records;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("invalid JSONL input at line {line_number}"));
+                }
+            };
+            let Value::Object(map) = value else {
+                bail!("JSONL values must be objects");
+            };
+
+            let array_indexes = vec![value_index];
+            value_index += 1;
+            saw_value = true;
+            record_streamed_object_occurrence(
+                &tx,
+                outdir,
+                &root_base,
+                &map,
+                Role::RootCollection,
+                &array_indexes,
+            )?;
+
+            batch_values += 1;
+            if batch_values >= STREAM_BATCH_VALUES {
+                tx.commit()?;
+                tx = conn.transaction()?;
+                batch_values = 0;
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    if !saw_value {
+        bail!("input is empty");
+    }
+
+    Ok(())
+}
+
+fn is_incomplete_trailing_jsonl_record(line: &str, error: &serde_json::Error) -> bool {
+    !line.ends_with('\n') && error.is_eof()
+}
+
+fn record_streamed_object_occurrence(
+    tx: &Transaction<'_>,
+    outdir: &Path,
+    path_base: &str,
+    object: &Map<String, Value>,
+    role: Role,
+    array_indexes: &[usize],
+) -> Result<()> {
+    match role {
+        Role::Object => {
+            tx.execute(
+                "INSERT INTO stream_object_totals(path_base, object_count) VALUES (?1, 1) \
+                 ON CONFLICT(path_base) DO UPDATE SET object_count = object_count + 1",
+                params![path_base],
+            )?;
+        }
+        Role::ArrayItem | Role::RootCollection => {
+            let schema = schema_for_single_object(outdir, path_base, object)?;
+            let canonical = canonical_json(&schema)?;
+            let schema_json = serde_json::to_string(&schema)?;
+            let role_name = role_storage_name(role);
+            let array_index_path = serde_json::to_string(array_indexes)?;
+            let index_path_key = index_path_sort_key(array_indexes);
+
+            tx.execute(
+                "INSERT INTO stream_item_schema_counts(role, path_base, canonical_json, schema_json, object_count) \
+                 VALUES (?1, ?2, ?3, ?4, 1) \
+                 ON CONFLICT(role, path_base, canonical_json) DO UPDATE SET object_count = object_count + 1",
+                params![role_name, path_base, &canonical, &schema_json],
+            )?;
+            tx.execute(
+                "INSERT INTO stream_item_schema_index_refs(role, path_base, canonical_json, array_index_path, index_path_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(role, path_base, array_index_path) DO UPDATE SET \
+                 canonical_json = excluded.canonical_json, index_path_key = excluded.index_path_key",
+                params![role_name, path_base, &canonical, &array_index_path, &index_path_key],
+            )?;
+
+            for field_name in object.keys() {
+                tx.execute(
+                    "INSERT INTO stream_item_schema_field_counts(role, path_base, canonical_json, field_name, field_count) \
+                     VALUES (?1, ?2, ?3, ?4, 1) \
+                     ON CONFLICT(role, path_base, canonical_json, field_name) DO UPDATE SET field_count = field_count + 1",
+                    params![role_name, path_base, &canonical, field_name],
+                )?;
+            }
+        }
+    }
+
+    for (key, child) in object {
+        let child_base = child_path_base(path_base, key);
+        if role == Role::Object {
+            record_object_field_fact(tx, path_base, key, child)?;
+            if let Value::Array(items) = child {
+                record_array_member_facts(tx, &child_base, 0, items)?;
+            }
+        }
+
+        match child {
+            Value::Object(map) => {
+                record_streamed_object_occurrence(
+                    tx,
+                    outdir,
+                    &child_base,
+                    map,
+                    Role::Object,
+                    array_indexes,
+                )?;
+            }
+            Value::Array(items) => {
+                record_streamed_array_object_occurrences(
+                    tx,
+                    outdir,
+                    &child_base,
+                    items,
+                    array_indexes,
+                )?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn record_streamed_array_object_occurrences(
+    tx: &Transaction<'_>,
+    outdir: &Path,
+    path_base: &str,
+    items: &[Value],
+    array_indexes: &[usize],
+) -> Result<()> {
+    for (index, item) in items.iter().enumerate() {
+        let mut item_indexes = array_indexes.to_vec();
+        item_indexes.push(index);
+        match item {
+            Value::Object(map) => record_streamed_object_occurrence(
+                tx,
+                outdir,
+                path_base,
+                map,
+                Role::ArrayItem,
+                &item_indexes,
+            )?,
+            Value::Array(nested) => record_streamed_array_object_occurrences(
+                tx,
+                outdir,
+                path_base,
+                nested,
+                &item_indexes,
+            )?,
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn record_object_field_fact(
+    tx: &Transaction<'_>,
+    path_base: &str,
+    field_name: &str,
+    value: &Value,
+) -> Result<()> {
+    let counts = ValueTypeCounts::single(value);
+    tx.execute(
+        "INSERT INTO stream_object_field_facts(\
+         path_base, field_name, present_count, array_count, boolean_count, null_count, number_count, object_count, string_count) \
+         VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(path_base, field_name) DO UPDATE SET \
+         present_count = present_count + 1, \
+         array_count = array_count + excluded.array_count, \
+         boolean_count = boolean_count + excluded.boolean_count, \
+         null_count = null_count + excluded.null_count, \
+         number_count = number_count + excluded.number_count, \
+         object_count = object_count + excluded.object_count, \
+         string_count = string_count + excluded.string_count",
+        params![
+            path_base,
+            field_name,
+            counts.array,
+            counts.boolean,
+            counts.null,
+            counts.number,
+            counts.object,
+            counts.string,
+        ],
+    )?;
+    Ok(())
+}
+
+fn record_array_member_facts(
+    tx: &Transaction<'_>,
+    path_base: &str,
+    depth: usize,
+    members: &[Value],
+) -> Result<()> {
+    for member in members {
+        let counts = ValueTypeCounts::single(member);
+        tx.execute(
+            "INSERT INTO stream_array_member_facts(\
+             path_base, depth, member_count, array_count, boolean_count, null_count, number_count, object_count, string_count) \
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(path_base, depth) DO UPDATE SET \
+             member_count = member_count + 1, \
+             array_count = array_count + excluded.array_count, \
+             boolean_count = boolean_count + excluded.boolean_count, \
+             null_count = null_count + excluded.null_count, \
+             number_count = number_count + excluded.number_count, \
+             object_count = object_count + excluded.object_count, \
+             string_count = string_count + excluded.string_count",
+            params![
+                path_base,
+                depth as i64,
+                counts.array,
+                counts.boolean,
+                counts.null,
+                counts.number,
+                counts.object,
+                counts.string,
+            ],
+        )?;
+
+        if let Value::Array(nested) = member {
+            record_array_member_facts(tx, path_base, depth + 1, nested)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValueTypeCounts {
+    array: i64,
+    boolean: i64,
+    null: i64,
+    number: i64,
+    object: i64,
+    string: i64,
+}
+
+impl ValueTypeCounts {
+    fn single(value: &Value) -> Self {
+        match value {
+            Value::Array(_) => Self {
+                array: 1,
+                boolean: 0,
+                null: 0,
+                number: 0,
+                object: 0,
+                string: 0,
+            },
+            Value::Bool(_) => Self {
+                array: 0,
+                boolean: 1,
+                null: 0,
+                number: 0,
+                object: 0,
+                string: 0,
+            },
+            Value::Null => Self {
+                array: 0,
+                boolean: 0,
+                null: 1,
+                number: 0,
+                object: 0,
+                string: 0,
+            },
+            Value::Number(_) => Self {
+                array: 0,
+                boolean: 0,
+                null: 0,
+                number: 1,
+                object: 0,
+                string: 0,
+            },
+            Value::Object(_) => Self {
+                array: 0,
+                boolean: 0,
+                null: 0,
+                number: 0,
+                object: 1,
+                string: 0,
+            },
+            Value::String(_) => Self {
+                array: 0,
+                boolean: 0,
+                null: 0,
+                number: 0,
+                object: 0,
+                string: 1,
+            },
+        }
+    }
+
+    fn type_names(self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.array > 0 {
+            out.push("array");
+        }
+        if self.boolean > 0 {
+            out.push("boolean");
+        }
+        if self.null > 0 {
+            out.push("null");
+        }
+        if self.number > 0 {
+            out.push("number");
+        }
+        if self.object > 0 {
+            out.push("object");
+        }
+        if self.string > 0 {
+            out.push("string");
+        }
+        out
+    }
+}
+
+#[derive(Debug)]
+struct StreamFieldFacts {
+    field_name: String,
+    present_count: i64,
+    counts: ValueTypeCounts,
+}
+
+#[derive(Debug)]
+struct StreamArrayFacts {
+    member_count: i64,
+    counts: ValueTypeCounts,
+}
+
+fn role_storage_name(role: Role) -> &'static str {
+    match role {
+        Role::Object => "object",
+        Role::ArrayItem => "array_item",
+        Role::RootCollection => "root_collection",
+    }
+}
+
+fn child_path_base(path_base: &str, key: &str) -> String {
+    format!("{}/{}", path_base, path_segment(key))
+}
+
+fn index_path_sort_key(index_path: &[usize]) -> String {
+    index_path
+        .iter()
+        .map(|index| format!("{index:020}"))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn schema_for_single_object(
+    outdir: &Path,
+    path_base: &str,
+    object: &Map<String, Value>,
+) -> Result<Value> {
+    let _ = outdir;
+    let mut schema = Map::new();
+    for key in object.keys().collect::<BTreeSet<_>>() {
+        let child_base = child_path_base(path_base, key);
+        let label = label_for_single_value(&child_base, &object[key])?;
+        schema.insert(key.clone(), Value::String(label));
+    }
+    Ok(Value::Object(schema))
+}
+
+fn label_for_single_value(path_base: &str, value: &Value) -> Result<String> {
+    match value {
+        Value::Null => Ok("null".to_string()),
+        Value::Bool(_) => Ok("boolean".to_string()),
+        Value::Number(_) => Ok("number".to_string()),
+        Value::String(_) => Ok("string".to_string()),
+        Value::Object(_) => Ok(format!("{path_base}.json")),
+        Value::Array(items) => Ok(format!(
+            "array({})",
+            array_member_label_for_single_array(path_base, items)?
+        )),
+    }
+}
+
+fn array_member_label_for_single_array(path_base: &str, members: &[Value]) -> Result<String> {
+    let members = members.iter().collect::<Vec<_>>();
+    array_member_label_for_single_members(path_base, &members)
+}
+
+fn array_member_label_for_single_members(path_base: &str, members: &[&Value]) -> Result<String> {
+    if members.is_empty() {
+        return Ok("empty".to_string());
+    }
+
+    let types = unique_types(members.iter().copied());
+    let mut labels = BTreeSet::new();
+    for primitive in ["boolean", "number", "string", "null"] {
+        if types.contains(&primitive) {
+            labels.insert(primitive.to_string());
+        }
+    }
+    if types.contains(&"object") {
+        labels.insert(format!("{path_base}.json"));
+    }
+    if types.contains(&"array") {
+        let nested = members
+            .iter()
+            .filter_map(|value| value.as_array())
+            .flat_map(|items| items.iter())
+            .collect::<Vec<_>>();
+        labels.insert(format!(
+            "array({})",
+            array_member_label_for_single_members(path_base, &nested)?
+        ));
+    }
+    Ok(union_member_labels(labels))
+}
+
+fn finalize_streamed_jsonl(
+    conn: &mut Connection,
+    outdir: &Path,
+    compact_output: bool,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    create_schema_index_tables(&tx)?;
+    let mut made_dirs = HashMap::<PathBuf, ()>::new();
+    write_streamed_object_records(&tx, outdir, compact_output, &mut made_dirs)?;
+    write_streamed_item_records(&tx, Role::ArrayItem, outdir, compact_output, &mut made_dirs)?;
+    write_streamed_item_records(
+        &tx,
+        Role::RootCollection,
+        outdir,
+        compact_output,
+        &mut made_dirs,
+    )?;
+    write_streamed_occurrence_statistics(&tx)?;
+    write_schema_relations_from_sqlite(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn create_schema_index_tables(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE schema_paths (schema_path TEXT NOT NULL, object_path TEXT PRIMARY KEY);
+         CREATE TABLE array_index_refs (array_path TEXT NOT NULL, array_index_path TEXT NOT NULL, schema_path TEXT NOT NULL, PRIMARY KEY (array_path, array_index_path));
+         CREATE TABLE schema_definitions (schema_path TEXT PRIMARY KEY, schema_kind TEXT NOT NULL, schema_json TEXT NOT NULL);
+         CREATE TABLE schema_object_counts (schema_path TEXT PRIMARY KEY, object_count INTEGER NOT NULL CHECK (object_count > 0));
+         CREATE TABLE schema_field_counts (schema_path TEXT NOT NULL, field_name TEXT NOT NULL, field_type TEXT NOT NULL, field_count INTEGER NOT NULL CHECK (field_count > 0), PRIMARY KEY (schema_path, field_name));
+         CREATE TABLE schema_relations (relation_id INTEGER PRIMARY KEY AUTOINCREMENT, from_schema_path TEXT NOT NULL, to_schema_path TEXT NOT NULL, relation_kind TEXT NOT NULL, fk_owner TEXT NOT NULL, fk_candidate INTEGER NOT NULL CHECK (fk_candidate IN (0, 1)), field_name TEXT NOT NULL, field_type TEXT NOT NULL, cardinality TEXT NOT NULL, required INTEGER NOT NULL CHECK (required IN (0, 1)), mixed INTEGER NOT NULL CHECK (mixed IN (0, 1)), nested_array_depth INTEGER NOT NULL DEFAULT 0 CHECK (nested_array_depth >= 0), via_schema_path TEXT, via_array_path TEXT, parent_schema_path TEXT NOT NULL, child_schema_path TEXT NOT NULL, parent_object_count INTEGER NOT NULL DEFAULT 0 CHECK (parent_object_count >= 0), child_object_count INTEGER NOT NULL DEFAULT 0 CHECK (child_object_count >= 0), field_count INTEGER NOT NULL DEFAULT 0 CHECK (field_count >= 0), UNIQUE (from_schema_path, to_schema_path, relation_kind, field_name, field_type, via_schema_path, via_array_path));
+         CREATE INDEX idx_schema_relations_from ON schema_relations(from_schema_path);
+         CREATE INDEX idx_schema_relations_to ON schema_relations(to_schema_path);
+         CREATE INDEX idx_schema_relations_kind ON schema_relations(relation_kind, fk_candidate);
+         CREATE INDEX idx_schema_relations_parent_child ON schema_relations(parent_schema_path, child_schema_path);",
+    )?;
+    Ok(())
+}
+
+fn write_streamed_object_records(
+    tx: &Transaction<'_>,
+    outdir: &Path,
+    compact_output: bool,
+    made_dirs: &mut HashMap<PathBuf, ()>,
+) -> Result<()> {
+    let path_bases = {
+        let mut stmt =
+            tx.prepare("SELECT path_base FROM stream_object_totals ORDER BY path_base")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for path_base in path_bases {
+        let schema = schema_for_streamed_object_path(tx, &path_base)?;
+        let canonical = canonical_json(&schema)?;
+        let schema_json = serde_json::to_string(&schema)?;
+        let object_path = format!("{path_base}.json");
+        tx.execute(
+            "INSERT INTO stream_object_schema_candidates(canonical_json, schema_json, object_path) VALUES (?1, ?2, ?3)",
+            params![canonical, schema_json, object_path],
+        )?;
+    }
+
+    let canonical_groups = {
+        let mut stmt = tx.prepare(
+            "SELECT canonical_json, MIN(schema_json), MIN(object_path) \
+             FROM stream_object_schema_candidates \
+             GROUP BY canonical_json \
+             ORDER BY canonical_json",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for (canonical, schema_json, schema_path) in canonical_groups {
+        let object_paths = {
+            let mut stmt = tx.prepare(
+                "SELECT object_path FROM stream_object_schema_candidates \
+                 WHERE canonical_json = ?1 ORDER BY object_path",
+            )?;
+            let rows = stmt
+                .query_map([&canonical], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        insert_streamed_schema_record(
+            tx,
+            &schema_path,
+            &schema_json,
+            &object_paths,
+            compact_output,
+            made_dirs,
+        )?;
+    }
+
+    let _ = outdir;
+    Ok(())
+}
+
+fn schema_for_streamed_object_path(tx: &Transaction<'_>, path_base: &str) -> Result<Value> {
+    let total = tx.query_row(
+        "SELECT object_count FROM stream_object_totals WHERE path_base = ?1",
+        [path_base],
+        |row| row.get::<_, i64>(0),
+    )?;
+
+    let facts = {
+        let mut stmt = tx.prepare(
+            "SELECT field_name, present_count, array_count, boolean_count, null_count, number_count, object_count, string_count \
+             FROM stream_object_field_facts \
+             WHERE path_base = ?1 \
+             ORDER BY field_name",
+        )?;
+        let rows = stmt
+            .query_map([path_base], |row| {
+                Ok(StreamFieldFacts {
+                    field_name: row.get(0)?,
+                    present_count: row.get(1)?,
+                    counts: ValueTypeCounts {
+                        array: row.get(2)?,
+                        boolean: row.get(3)?,
+                        null: row.get(4)?,
+                        number: row.get(5)?,
+                        object: row.get(6)?,
+                        string: row.get(7)?,
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    let mut schema = Map::new();
+    for fact in facts {
+        let child_base = child_path_base(path_base, &fact.field_name);
+        let label = streamed_field_label(tx, &child_base, &fact, total)?;
+        schema.insert(fact.field_name, Value::String(label));
+    }
+    Ok(Value::Object(schema))
+}
+
+fn streamed_field_label(
+    tx: &Transaction<'_>,
+    child_base: &str,
+    fact: &StreamFieldFacts,
+    total: i64,
+) -> Result<String> {
+    let types = fact.counts.type_names();
+    if fact.counts.array > 0 {
+        let mut labels = BTreeSet::new();
+        labels.insert(streamed_array_label(tx, child_base)?);
+        for value_type in types {
+            if !matches!(value_type, "array" | "null") {
+                labels.insert(value_type.to_string());
+            }
+        }
+        return Ok(union_member_labels(labels));
+    }
+
+    if fact.counts.object > 0 {
+        if types
+            .iter()
+            .all(|value_type| matches!(*value_type, "object" | "null"))
+        {
+            return Ok(format!("{child_base}.json"));
+        }
+        return Ok(types
+            .iter()
+            .filter(|value_type| **value_type != "null")
+            .copied()
+            .collect::<Vec<_>>()
+            .join("|"));
+    }
+
+    Ok(primitive_label_from_counts(fact, total))
+}
+
+fn primitive_label_from_counts(fact: &StreamFieldFacts, total: i64) -> String {
+    let types = fact.counts.type_names();
+    let mut result = if types == vec!["null"] {
+        "null".to_string()
+    } else if types.len() == 1 {
+        types[0].to_string()
+    } else if types.len() == 2 && types[0] == "null" {
+        format!("{}?", types[1])
+    } else {
+        types.join("|")
+    };
+
+    if fact.present_count < total && result != "null" && !result.ends_with('?') {
+        result.push('?');
+    }
+    result
+}
+
+fn streamed_array_label(tx: &Transaction<'_>, path_base: &str) -> Result<String> {
+    Ok(format!(
+        "array({})",
+        streamed_array_member_label(tx, path_base, 0)?
+    ))
+}
+
+fn streamed_array_member_label(
+    tx: &Transaction<'_>,
+    path_base: &str,
+    depth: usize,
+) -> Result<String> {
+    let facts = tx
+        .query_row(
+            "SELECT member_count, array_count, boolean_count, null_count, number_count, object_count, string_count \
+             FROM stream_array_member_facts WHERE path_base = ?1 AND depth = ?2",
+            params![path_base, depth as i64],
+            |row| {
+                Ok(StreamArrayFacts {
+                    member_count: row.get(0)?,
+                    counts: ValueTypeCounts {
+                        array: row.get(1)?,
+                        boolean: row.get(2)?,
+                        null: row.get(3)?,
+                        number: row.get(4)?,
+                        object: row.get(5)?,
+                        string: row.get(6)?,
+                    },
+                })
+            },
+        )
+        .optional()?;
+
+    let Some(facts) = facts else {
+        return Ok("empty".to_string());
+    };
+    if facts.member_count == 0 {
+        return Ok("empty".to_string());
+    }
+
+    let mut labels = BTreeSet::new();
+    if facts.counts.boolean > 0 {
+        labels.insert("boolean".to_string());
+    }
+    if facts.counts.number > 0 {
+        labels.insert("number".to_string());
+    }
+    if facts.counts.string > 0 {
+        labels.insert("string".to_string());
+    }
+    if facts.counts.null > 0 {
+        labels.insert("null".to_string());
+    }
+    if facts.counts.object > 0 {
+        labels.insert(format!("{path_base}.json"));
+    }
+    if facts.counts.array > 0 {
+        labels.insert(format!(
+            "array({})",
+            streamed_array_member_label(tx, path_base, depth + 1)?
+        ));
+    }
+    Ok(union_member_labels(labels))
+}
+
+fn write_streamed_item_records(
+    tx: &Transaction<'_>,
+    role: Role,
+    outdir: &Path,
+    compact_output: bool,
+    made_dirs: &mut HashMap<PathBuf, ()>,
+) -> Result<()> {
+    let role_name = role_storage_name(role);
+    let path_bases = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT path_base FROM stream_item_schema_counts \
+             WHERE role = ?1 ORDER BY path_base",
+        )?;
+        let rows = stmt
+            .query_map([role_name], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for path_base in path_bases {
+        let schema_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM stream_item_schema_counts WHERE role = ?1 AND path_base = ?2",
+            params![role_name, &path_base],
+            |row| row.get(0),
+        )?;
+
+        if schema_count == 1 {
+            let (canonical, schema_json) = tx.query_row(
+                "SELECT canonical_json, schema_json FROM stream_item_schema_counts \
+                 WHERE role = ?1 AND path_base = ?2",
+                params![role_name, &path_base],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            let schema_path = format!("{path_base}.json");
+            let object_paths = vec![schema_path.clone()];
+            insert_streamed_schema_record(
+                tx,
+                &schema_path,
+                &schema_json,
+                &object_paths,
+                compact_output,
+                made_dirs,
+            )?;
+            insert_streamed_array_index_refs_for_item_schema(
+                tx,
+                &schema_path,
+                &schema_path,
+                role_name,
+                &path_base,
+                &canonical,
+            )?;
+            insert_item_schema_path(tx, role_name, &path_base, &canonical, &schema_path)?;
+            continue;
+        }
+
+        if role == Role::ArrayItem {
+            let container_path = format!("{path_base}.json");
+            let container_schema = json!({"$refs_mut": format!("{path_base}/")});
+            let container_json = serde_json::to_string(&container_schema)?;
+            insert_streamed_schema_record(
+                tx,
+                &container_path,
+                &container_json,
+                &[container_path.clone()],
+                compact_output,
+                made_dirs,
+            )?;
+        }
+
+        let variants = {
+            let mut stmt = tx.prepare(
+                "SELECT c.canonical_json, c.schema_json, MIN(r.index_path_key) \
+                 FROM stream_item_schema_counts AS c \
+                 JOIN stream_item_schema_index_refs AS r \
+                   ON r.role = c.role AND r.path_base = c.path_base AND r.canonical_json = c.canonical_json \
+                 WHERE c.role = ?1 AND c.path_base = ?2 \
+                 GROUP BY c.canonical_json, c.schema_json \
+                 ORDER BY MIN(r.index_path_key)",
+            )?;
+            let rows = stmt
+                .query_map(params![role_name, &path_base], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+
+        for (canonical, schema_json, _first_key) in variants {
+            let first_index_path: String = tx.query_row(
+                "SELECT array_index_path FROM stream_item_schema_index_refs \
+                 WHERE role = ?1 AND path_base = ?2 AND canonical_json = ?3 \
+                 ORDER BY index_path_key LIMIT 1",
+                params![role_name, &path_base, &canonical],
+                |row| row.get(0),
+            )?;
+            let index_path = serde_json::from_str::<Vec<usize>>(&first_index_path)
+                .with_context(|| format!("invalid stored array index path: {first_index_path}"))?;
+            let file_stem = index_path_file_stem(&index_path);
+            let schema_path = format!("{path_base}/{file_stem}.json");
+            let object_paths = vec![schema_path.clone()];
+            let array_parent = format!("{path_base}.json");
+            insert_streamed_schema_record(
+                tx,
+                &schema_path,
+                &schema_json,
+                &object_paths,
+                compact_output,
+                made_dirs,
+            )?;
+            insert_streamed_array_index_refs_for_item_schema(
+                tx,
+                &array_parent,
+                &schema_path,
+                role_name,
+                &path_base,
+                &canonical,
+            )?;
+            insert_item_schema_path(tx, role_name, &path_base, &canonical, &schema_path)?;
+        }
+    }
+
+    let _ = outdir;
+    Ok(())
+}
+
+fn insert_streamed_array_index_refs_for_item_schema(
+    tx: &Transaction<'_>,
+    array_path: &str,
+    schema_path: &str,
+    role_name: &str,
+    path_base: &str,
+    canonical: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO array_index_refs(array_path, array_index_path, schema_path) \
+         SELECT ?1, array_index_path, ?2 \
+         FROM stream_item_schema_index_refs \
+         WHERE role = ?3 AND path_base = ?4 AND canonical_json = ?5",
+        params![array_path, schema_path, role_name, path_base, canonical],
+    )?;
+    Ok(())
+}
+
+fn insert_item_schema_path(
+    tx: &Transaction<'_>,
+    role_name: &str,
+    path_base: &str,
+    canonical: &str,
+    schema_path: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO stream_item_schema_paths(role, path_base, canonical_json, schema_path) VALUES (?1, ?2, ?3, ?4)",
+        params![role_name, path_base, canonical, schema_path],
+    )?;
+    Ok(())
+}
+
+fn insert_streamed_schema_record(
+    tx: &Transaction<'_>,
+    schema_path: &str,
+    schema_json: &str,
+    object_paths: &[String],
+    compact_output: bool,
+    made_dirs: &mut HashMap<PathBuf, ()>,
+) -> Result<()> {
+    let schema_value = serde_json::from_str::<Value>(schema_json)
+        .with_context(|| format!("invalid schema JSON for {schema_path}"))?;
+    let schema_kind = schema_kind(&schema_value);
+    let canonical = PathBuf::from(schema_path);
+    ensure_parent(&canonical, made_dirs)?;
+    let file_json = if compact_output {
+        schema_json.to_string()
+    } else {
+        serde_json::to_string_pretty(&schema_value)?
+    };
+    fs::write(&canonical, format!("{file_json}\n"))
+        .with_context(|| format!("failed to write {}", canonical.display()))?;
+
+    tx.execute(
+        "INSERT INTO schema_definitions(schema_path, schema_kind, schema_json) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(schema_path) DO UPDATE SET schema_kind=excluded.schema_kind, schema_json=excluded.schema_json",
+        params![schema_path, schema_kind, schema_json],
+    )?;
+    insert_schema_field_types(tx, schema_path, &schema_value)?;
+
+    for object_path in object_paths {
+        tx.execute(
+            "INSERT INTO schema_paths(schema_path, object_path) VALUES (?1, ?2) \
+             ON CONFLICT(object_path) DO UPDATE SET schema_path=excluded.schema_path",
+            params![schema_path, object_path],
+        )?;
+
+        if object_path != schema_path {
+            let object_path = PathBuf::from(object_path);
+            ensure_parent(&object_path, made_dirs)?;
+            replace_with_symlink(&canonical, &object_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn insert_schema_field_types(
+    tx: &Transaction<'_>,
+    schema_path: &str,
+    schema: &Value,
+) -> Result<()> {
+    let Some(map) = schema.as_object() else {
+        return Ok(());
+    };
+    for (field_name, field_type) in map {
+        let Some(field_type) = field_type.as_str() else {
+            continue;
+        };
+        tx.execute(
+            "INSERT INTO stream_schema_field_types(schema_path, field_name, field_type) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(schema_path, field_name) DO UPDATE SET field_type = excluded.field_type",
+            params![schema_path, field_name, field_type],
+        )?;
+    }
+    Ok(())
+}
+
+fn write_streamed_occurrence_statistics(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "INSERT INTO schema_object_counts(schema_path, object_count) \
+         SELECT sp.schema_path, SUM(t.object_count) \
+         FROM stream_object_totals AS t \
+         JOIN schema_paths AS sp ON sp.object_path = t.path_base || '.json' \
+         JOIN schema_definitions AS d ON d.schema_path = sp.schema_path \
+         WHERE d.schema_kind != 'heterogeneous' \
+         GROUP BY sp.schema_path \
+         ON CONFLICT(schema_path) DO UPDATE SET object_count = schema_object_counts.object_count + excluded.object_count",
+        [],
+    )?;
+
+    tx.execute(
+        "INSERT INTO schema_field_counts(schema_path, field_name, field_type, field_count) \
+         SELECT sp.schema_path, f.field_name, ft.field_type, SUM(f.present_count) \
+         FROM stream_object_field_facts AS f \
+         JOIN schema_paths AS sp ON sp.object_path = f.path_base || '.json' \
+         JOIN schema_definitions AS d ON d.schema_path = sp.schema_path \
+         JOIN stream_schema_field_types AS ft ON ft.schema_path = sp.schema_path AND ft.field_name = f.field_name \
+         WHERE d.schema_kind != 'heterogeneous' \
+         GROUP BY sp.schema_path, f.field_name, ft.field_type \
+         ON CONFLICT(schema_path, field_name) DO UPDATE SET \
+         field_type = excluded.field_type, \
+         field_count = schema_field_counts.field_count + excluded.field_count",
+        [],
+    )?;
+
+    tx.execute(
+        "INSERT INTO schema_object_counts(schema_path, object_count) \
+         SELECT m.schema_path, SUM(c.object_count) \
+         FROM stream_item_schema_counts AS c \
+         JOIN stream_item_schema_paths AS m \
+           ON m.role = c.role AND m.path_base = c.path_base AND m.canonical_json = c.canonical_json \
+         JOIN schema_definitions AS d ON d.schema_path = m.schema_path \
+         WHERE d.schema_kind != 'heterogeneous' \
+         GROUP BY m.schema_path \
+         ON CONFLICT(schema_path) DO UPDATE SET object_count = schema_object_counts.object_count + excluded.object_count",
+        [],
+    )?;
+
+    tx.execute(
+        "INSERT INTO schema_field_counts(schema_path, field_name, field_type, field_count) \
+         SELECT m.schema_path, f.field_name, ft.field_type, SUM(f.field_count) \
+         FROM stream_item_schema_field_counts AS f \
+         JOIN stream_item_schema_paths AS m \
+           ON m.role = f.role AND m.path_base = f.path_base AND m.canonical_json = f.canonical_json \
+         JOIN schema_definitions AS d ON d.schema_path = m.schema_path \
+         JOIN stream_schema_field_types AS ft ON ft.schema_path = m.schema_path AND ft.field_name = f.field_name \
+         WHERE d.schema_kind != 'heterogeneous' \
+         GROUP BY m.schema_path, f.field_name, ft.field_type \
+         ON CONFLICT(schema_path, field_name) DO UPDATE SET \
+         field_type = excluded.field_type, \
+         field_count = schema_field_counts.field_count + excluded.field_count",
+        [],
+    )?;
+
+    Ok(())
+}
+
+fn write_schema_relations_from_sqlite(tx: &Transaction<'_>) -> Result<()> {
+    let records = {
+        let mut stmt = tx.prepare(
+            "SELECT d.schema_path, d.schema_json, \
+                    (SELECT MIN(r.array_path) FROM array_index_refs AS r WHERE r.schema_path = d.schema_path) AS array_parent \
+             FROM schema_definitions AS d \
+             ORDER BY d.schema_path",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let schema_json: String = row.get(1)?;
+                Ok(Record {
+                    schema_path: row.get(0)?,
+                    object_paths: Vec::new(),
+                    schema: serde_json::from_str(&schema_json).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?,
+                    array_parent: row.get(2)?,
+                    array_index_paths: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    write_schema_relations(tx, &records)
 }
 
 fn build_schema_output(outdir: &Path, entries: Vec<Entry>) -> Result<SchemaBuild> {
@@ -900,6 +2153,7 @@ fn canonical_json(value: &Value) -> Result<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct SchemaCount {
     schema_path: String,
     schema_kind: String,
@@ -907,12 +2161,14 @@ struct SchemaCount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct SchemaObjectPath {
     schema_path: String,
     object_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct SchemaArrayIndexRef {
     schema_path: String,
     array_path: String,
@@ -920,6 +2176,7 @@ struct SchemaArrayIndexRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct FieldCount {
     schema_path: String,
     field_name: String,
@@ -928,6 +2185,7 @@ struct FieldCount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct ReportData {
     schemas: Vec<SchemaCount>,
     object_paths: Vec<SchemaObjectPath>,
@@ -952,6 +2210,7 @@ enum ReportDetail {
     FullFile,
 }
 
+#[cfg(test)]
 fn load_report_from_sqlite(database: &Path) -> Result<ReportData> {
     if !database.exists() {
         bail!(
@@ -969,6 +2228,7 @@ fn load_report_from_sqlite(database: &Path) -> Result<ReportData> {
     read_report_data(&conn)
 }
 
+#[cfg(test)]
 fn read_report_data(conn: &Connection) -> Result<ReportData> {
     ensure_field_type_column_exists(conn)?;
 
@@ -1086,22 +2346,294 @@ fn ensure_table_has_column(
     }
 }
 
-fn emit_report(
-    report: &ReportData,
+fn emit_report_from_sqlite(
+    database: &Path,
     summary: &ReportSummary,
     output_path: Option<&Path>,
 ) -> Result<()> {
     if let Some(output_path) = output_path {
-        write_text_file(
-            output_path,
-            &render_report(report, summary, ReportDetail::FullFile),
+        if let Some(parent) = output_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file = fs::File::create(output_path)
+            .with_context(|| format!("failed to write {}", output_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        render_report_from_sqlite_to_writer(
+            database,
+            summary,
+            ReportDetail::FullFile,
+            None,
+            &mut writer,
         )?;
-        print!("{}", render_summary(report, summary, Some(output_path)));
+        writer.flush()?;
+
+        let stdout = io::stdout();
+        let mut stdout = BufWriter::new(stdout.lock());
+        render_summary_from_sqlite_to_writer(database, summary, Some(output_path), &mut stdout)?;
+        stdout.flush()?;
     } else {
-        print!(
-            "{}",
-            render_report(report, summary, ReportDetail::CompactStdout)
+        let stdout = io::stdout();
+        let mut stdout = BufWriter::new(stdout.lock());
+        render_report_from_sqlite_to_writer(
+            database,
+            summary,
+            ReportDetail::CompactStdout,
+            None,
+            &mut stdout,
+        )?;
+        stdout.flush()?;
+    }
+
+    Ok(())
+}
+
+fn render_report_from_sqlite_to_writer<W: Write>(
+    database: &Path,
+    summary: &ReportSummary,
+    detail: ReportDetail,
+    output_path: Option<&Path>,
+    writer: &mut W,
+) -> Result<()> {
+    if !database.exists() {
+        bail!(
+            "SQLite report source does not exist: {}",
+            database.display()
         );
+    }
+
+    let conn = Connection::open(database).with_context(|| {
+        format!(
+            "failed to open SQLite report source: {}",
+            database.display()
+        )
+    })?;
+    ensure_field_type_column_exists(&conn)?;
+
+    writeln!(writer, "# dump-json-refs report")?;
+    writeln!(writer)?;
+    write_schemas_section_from_sqlite(&conn, writer)?;
+
+    match detail {
+        ReportDetail::CompactStdout => {
+            write_fields_section_from_sqlite(&conn, writer)?;
+            write_schema_aliases_section_from_sqlite(&conn, writer)?;
+        }
+        ReportDetail::FullFile => {
+            write_schema_object_paths_section_from_sqlite(&conn, writer)?;
+            write_schema_array_index_refs_section_from_sqlite(&conn, writer)?;
+            write_fields_section_from_sqlite(&conn, writer)?;
+        }
+    }
+
+    render_summary_from_conn_to_writer(&conn, summary, output_path, writer)?;
+    Ok(())
+}
+
+fn schema_order_sql() -> &'static str {
+    "SELECT paths.schema_path, defs.schema_kind, COALESCE(counts.object_count, 0) AS object_count \
+     FROM (SELECT DISTINCT schema_path FROM schema_paths) AS paths \
+     JOIN schema_definitions AS defs ON defs.schema_path = paths.schema_path \
+     LEFT JOIN schema_object_counts AS counts ON counts.schema_path = paths.schema_path"
+}
+
+fn write_schemas_section_from_sqlite<W: Write>(conn: &Connection, writer: &mut W) -> Result<()> {
+    writeln!(writer, "[schemas]")?;
+    writeln!(writer, "schema_path\tschema_kind\tobject_count")?;
+    let mut stmt = conn.prepare(&format!(
+        "{} ORDER BY object_count DESC, paths.schema_path",
+        schema_order_sql()
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let schema_path: String = row.get(0)?;
+        let schema_kind: String = row.get(1)?;
+        let object_count: i64 = row.get(2)?;
+        writeln!(writer, "{schema_path}\t{schema_kind}\t{object_count}")?;
+    }
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn write_schema_object_paths_section_from_sqlite<W: Write>(
+    conn: &Connection,
+    writer: &mut W,
+) -> Result<()> {
+    writeln!(writer, "[schema_object_paths]")?;
+    writeln!(writer, "schema_path\tobject_path")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.schema_path, p.object_path \
+         FROM schema_paths AS p \
+         JOIN ({}) AS schema_order ON schema_order.schema_path = p.schema_path \
+         ORDER BY schema_order.object_count DESC, p.schema_path, p.object_path",
+        schema_order_sql()
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let schema_path: String = row.get(0)?;
+        let object_path: String = row.get(1)?;
+        writeln!(writer, "{schema_path}\t{object_path}")?;
+    }
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn write_schema_aliases_section_from_sqlite<W: Write>(
+    conn: &Connection,
+    writer: &mut W,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.schema_path, p.object_path \
+         FROM schema_paths AS p \
+         JOIN ({}) AS schema_order ON schema_order.schema_path = p.schema_path \
+         WHERE p.schema_path != p.object_path \
+         ORDER BY schema_order.object_count DESC, p.schema_path, p.object_path",
+        schema_order_sql()
+    ))?;
+    let mut rows = stmt.query([])?;
+    let mut wrote_header = false;
+    while let Some(row) = rows.next()? {
+        if !wrote_header {
+            writeln!(writer, "[schema_aliases]")?;
+            writeln!(writer, "schema_path\tobject_path")?;
+            wrote_header = true;
+        }
+        let schema_path: String = row.get(0)?;
+        let object_path: String = row.get(1)?;
+        writeln!(writer, "{schema_path}\t{object_path}")?;
+    }
+    if wrote_header {
+        writeln!(writer)?;
+    }
+    Ok(())
+}
+
+fn write_schema_array_index_refs_section_from_sqlite<W: Write>(
+    conn: &Connection,
+    writer: &mut W,
+) -> Result<()> {
+    writeln!(writer, "[schema_array_index_refs]")?;
+    writeln!(writer, "schema_path\tarray_path\tarray_index_path")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT r.schema_path, r.array_path, r.array_index_path \
+         FROM array_index_refs AS r \
+         JOIN ({}) AS schema_order ON schema_order.schema_path = r.schema_path \
+         ORDER BY schema_order.object_count DESC, r.schema_path, r.array_path, r.array_index_path",
+        schema_order_sql()
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let schema_path: String = row.get(0)?;
+        let array_path: String = row.get(1)?;
+        let array_index_path: String = row.get(2)?;
+        writeln!(writer, "{schema_path}\t{array_path}\t{array_index_path}")?;
+    }
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn write_fields_section_from_sqlite<W: Write>(conn: &Connection, writer: &mut W) -> Result<()> {
+    writeln!(writer, "[fields]")?;
+    writeln!(writer, "schema_path\tfield_name\tfield_type\tfield_count")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT f.schema_path, f.field_name, f.field_type, f.field_count \
+         FROM schema_field_counts AS f \
+         JOIN ({}) AS schema_order ON schema_order.schema_path = f.schema_path \
+         ORDER BY schema_order.object_count DESC, f.schema_path, f.field_count DESC, f.field_name",
+        schema_order_sql()
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let schema_path: String = row.get(0)?;
+        let field_name: String = row.get(1)?;
+        let field_type: String = row.get(2)?;
+        let field_count: i64 = row.get(3)?;
+        writeln!(
+            writer,
+            "{schema_path}\t{field_name}\t{field_type}\t{field_count}"
+        )?;
+    }
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn render_summary_from_sqlite_to_writer<W: Write>(
+    database: &Path,
+    summary: &ReportSummary,
+    output_path: Option<&Path>,
+    writer: &mut W,
+) -> Result<()> {
+    if !database.exists() {
+        bail!(
+            "SQLite report source does not exist: {}",
+            database.display()
+        );
+    }
+    let conn = Connection::open(database).with_context(|| {
+        format!(
+            "failed to open SQLite report source: {}",
+            database.display()
+        )
+    })?;
+    ensure_field_type_column_exists(&conn)?;
+    render_summary_from_conn_to_writer(&conn, summary, output_path, writer)
+}
+
+fn render_summary_from_conn_to_writer<W: Write>(
+    conn: &Connection,
+    summary: &ReportSummary,
+    output_path: Option<&Path>,
+    writer: &mut W,
+) -> Result<()> {
+    let schema_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT p.schema_path FROM schema_paths AS p JOIN schema_definitions AS d ON d.schema_path = p.schema_path)",
+        [],
+        |row| row.get(0),
+    )?;
+    let field_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM schema_field_counts", [], |row| {
+            row.get(0)
+        })?;
+    let object_path_mapping_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM schema_paths", [], |row| row.get(0))?;
+    let schema_alias_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM schema_paths WHERE schema_path != object_path",
+        [],
+        |row| row.get(0),
+    )?;
+    let array_index_ref_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM array_index_refs", [], |row| {
+            row.get(0)
+        })?;
+
+    writeln!(writer, "[summary]")?;
+    writeln!(writer, "schema_count\t{schema_count}")?;
+    writeln!(writer, "field_count\t{field_count}")?;
+    writeln!(
+        writer,
+        "object_path_mapping_count\t{object_path_mapping_count}"
+    )?;
+    writeln!(writer, "schema_alias_count\t{schema_alias_count}")?;
+    writeln!(writer, "array_index_ref_count\t{array_index_ref_count}")?;
+
+    match summary {
+        ReportSummary::Generated {
+            execution_time_ms,
+            input_source,
+        } => {
+            writeln!(writer, "execution_time_ms\t{execution_time_ms}")?;
+            writeln!(writer, "input\t{input_source}")?;
+        }
+        ReportSummary::FromSqlite { sqlite_path } => {
+            writeln!(writer, "sqlite_path\t{sqlite_path}")?;
+        }
+    }
+
+    if let Some(output_path) = output_path {
+        writeln!(writer, "report\t{}", output_path.display())?;
     }
 
     Ok(())
@@ -1119,6 +2651,7 @@ fn write_text_file(path: &Path, text: &str) -> Result<()> {
     fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
 }
 
+#[cfg(test)]
 fn render_report(report: &ReportData, summary: &ReportSummary, detail: ReportDetail) -> String {
     let mut out = String::new();
 
@@ -1141,6 +2674,7 @@ fn render_report(report: &ReportData, summary: &ReportSummary, detail: ReportDet
     out
 }
 
+#[cfg(test)]
 fn push_schemas_section(out: &mut String, report: &ReportData) {
     out.push_str("[schemas]\n");
     out.push_str("schema_path\tschema_kind\tobject_count\n");
@@ -1153,6 +2687,7 @@ fn push_schemas_section(out: &mut String, report: &ReportData) {
     out.push('\n');
 }
 
+#[cfg(test)]
 fn push_schema_object_paths_section(out: &mut String, report: &ReportData) {
     out.push_str("[schema_object_paths]\n");
     out.push_str("schema_path\tobject_path\n");
@@ -1165,6 +2700,7 @@ fn push_schema_object_paths_section(out: &mut String, report: &ReportData) {
     out.push('\n');
 }
 
+#[cfg(test)]
 fn push_schema_aliases_section_if_non_empty(out: &mut String, report: &ReportData) {
     let aliases = report
         .object_paths
@@ -1187,6 +2723,7 @@ fn push_schema_aliases_section_if_non_empty(out: &mut String, report: &ReportDat
     out.push('\n');
 }
 
+#[cfg(test)]
 fn push_schema_array_index_refs_section(out: &mut String, report: &ReportData) {
     out.push_str("[schema_array_index_refs]\n");
     out.push_str("schema_path\tarray_path\tarray_index_path\n");
@@ -1199,6 +2736,7 @@ fn push_schema_array_index_refs_section(out: &mut String, report: &ReportData) {
     out.push('\n');
 }
 
+#[cfg(test)]
 fn push_fields_section(out: &mut String, report: &ReportData) {
     out.push_str("[fields]\n");
     out.push_str("schema_path\tfield_name\tfield_type\tfield_count\n");
@@ -1211,6 +2749,7 @@ fn push_fields_section(out: &mut String, report: &ReportData) {
     out.push('\n');
 }
 
+#[cfg(test)]
 fn render_summary(
     report: &ReportData,
     summary: &ReportSummary,
@@ -2917,5 +4456,126 @@ mod tests {
 
         drop(conn);
         fs::remove_dir_all(outdir).unwrap();
+    }
+
+    #[test]
+    fn streaming_jsonl_generation_matches_existing_jsonl_pipeline() {
+        let legacy_outdir = temp_outdir("legacy-jsonl-equivalence");
+        let streaming_outdir = temp_outdir("streaming-jsonl-equivalence");
+        let jsonl = concat!(
+            "\0\0{\"kind\":\"snapshot\",\"payload\":{\"id\":1,\"tags\":[\"a\"],\"items\":[{\"sku\":\"a\",\"qty\":1}]}}\n",
+            "{\"kind\":\"event\",\"payload\":{\"id\":2,\"tags\":[],\"items\":[{\"sku\":\"b\"},{\"sku\":\"c\",\"note\":null}]}}\n",
+            "{\"kind\":\"event\",\"payload\":{\"id\":\"mixed\",\"items\":[{\"sku\":\"d\",\"qty\":4},[ {\"sku\":\"nested\"} ]]}}\n",
+        );
+
+        let entries = normalize_input(jsonl, true, true, "sample").unwrap();
+        let legacy_build = build_schema_output(&legacy_outdir, entries).unwrap();
+        write_files_and_index(
+            &legacy_outdir,
+            &legacy_build.records,
+            &legacy_build.occurrences,
+            false,
+        )
+        .unwrap();
+
+        stream_jsonl_reader_to_outdir(jsonl.as_bytes(), &streaming_outdir, true, "sample", false)
+            .unwrap();
+
+        let legacy_conn = Connection::open(legacy_outdir.join("schemas.sqlite")).unwrap();
+        let streaming_conn = Connection::open(streaming_outdir.join("schemas.sqlite")).unwrap();
+        let legacy_rows = dump_index_rows_for_test(&legacy_conn).unwrap();
+        let streaming_rows = dump_index_rows_for_test(&streaming_conn).unwrap();
+        assert_eq!(
+            legacy_rows.replace(&legacy_outdir.display().to_string(), "OUTDIR"),
+            streaming_rows.replace(&streaming_outdir.display().to_string(), "OUTDIR")
+        );
+
+        let legacy_report = load_report_from_sqlite(&legacy_outdir.join("schemas.sqlite")).unwrap();
+        let legacy_rendered = render_report(
+            &legacy_report,
+            &ReportSummary::FromSqlite {
+                sqlite_path: "refs/schemas.sqlite".to_string(),
+            },
+            ReportDetail::CompactStdout,
+        );
+        let mut streaming_rendered = Vec::new();
+        render_report_from_sqlite_to_writer(
+            &streaming_outdir.join("schemas.sqlite"),
+            &ReportSummary::FromSqlite {
+                sqlite_path: "refs/schemas.sqlite".to_string(),
+            },
+            ReportDetail::CompactStdout,
+            None,
+            &mut streaming_rendered,
+        )
+        .unwrap();
+        let streaming_rendered = String::from_utf8(streaming_rendered).unwrap();
+        assert_eq!(
+            legacy_rendered.replace(&legacy_outdir.display().to_string(), "OUTDIR"),
+            streaming_rendered.replace(&streaming_outdir.display().to_string(), "OUTDIR")
+        );
+
+        drop(legacy_conn);
+        drop(streaming_conn);
+        fs::remove_dir_all(legacy_outdir).unwrap();
+        fs::remove_dir_all(streaming_outdir).unwrap();
+    }
+
+    #[test]
+    fn streaming_jsonl_skips_incomplete_trailing_record() {
+        let complete_outdir = temp_outdir("complete-jsonl-tail");
+        let truncated_outdir = temp_outdir("truncated-jsonl-tail");
+        let complete = "{\"kind\":\"snapshot\"}\n{\"kind\":\"event\"}\n";
+        let truncated = "{\"kind\":\"snapshot\"}\n{\"kind\":\"event\"}\n{\"kind\":\"partial";
+
+        stream_jsonl_reader_to_outdir(complete.as_bytes(), &complete_outdir, true, "tail", false)
+            .unwrap();
+        stream_jsonl_reader_to_outdir(truncated.as_bytes(), &truncated_outdir, true, "tail", false)
+            .unwrap();
+
+        let complete_conn = Connection::open(complete_outdir.join("schemas.sqlite")).unwrap();
+        let truncated_conn = Connection::open(truncated_outdir.join("schemas.sqlite")).unwrap();
+        let complete_rows = dump_index_rows_for_test(&complete_conn).unwrap();
+        let truncated_rows = dump_index_rows_for_test(&truncated_conn).unwrap();
+        assert_eq!(
+            complete_rows.replace(&complete_outdir.display().to_string(), "OUTDIR"),
+            truncated_rows.replace(&truncated_outdir.display().to_string(), "OUTDIR")
+        );
+
+        drop(complete_conn);
+        drop(truncated_conn);
+        fs::remove_dir_all(complete_outdir).unwrap();
+        fs::remove_dir_all(truncated_outdir).unwrap();
+    }
+
+    fn dump_index_rows_for_test(conn: &Connection) -> Result<String> {
+        let mut out = String::new();
+        for sql in [
+            "SELECT 'schema_paths', schema_path, object_path FROM schema_paths ORDER BY schema_path, object_path",
+            "SELECT 'array_index_refs', array_path, array_index_path, schema_path FROM array_index_refs ORDER BY array_path, array_index_path, schema_path",
+            "SELECT 'schema_definitions', schema_path, schema_kind, schema_json FROM schema_definitions ORDER BY schema_path",
+            "SELECT 'schema_object_counts', schema_path, object_count FROM schema_object_counts ORDER BY schema_path",
+            "SELECT 'schema_field_counts', schema_path, field_name, field_type, field_count FROM schema_field_counts ORDER BY schema_path, field_name, field_type",
+            "SELECT 'schema_relations', from_schema_path, to_schema_path, relation_kind, fk_owner, fk_candidate, field_name, field_type, cardinality, required, mixed, nested_array_depth, COALESCE(via_schema_path, ''), COALESCE(via_array_path, ''), parent_schema_path, child_schema_path, parent_object_count, child_object_count, field_count FROM schema_relations ORDER BY from_schema_path, to_schema_path, relation_kind, field_name, field_type, COALESCE(via_schema_path, ''), COALESCE(via_array_path, '')",
+        ] {
+            let mut stmt = conn.prepare(sql)?;
+            let column_count = stmt.column_count();
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                for index in 0..column_count {
+                    if index > 0 {
+                        out.push('\t');
+                    }
+                    let value = row
+                        .get_ref(index)?
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|_| row.get::<_, i64>(index).map(|value| value.to_string()))?;
+                    out.push_str(&value);
+                }
+                out.push('\n');
+            }
+        }
+        Ok(out)
     }
 }
