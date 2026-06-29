@@ -174,6 +174,34 @@ fn graph_arg_was_provided(matches: &clap::ArgMatches) -> bool {
     })
 }
 
+fn perf_trace_enabled() -> bool {
+    std::env::var_os("DUMP_JSON_REFS_TRACE").is_some()
+}
+
+fn perf_trace(stage: &str, started: Instant) {
+    if perf_trace_enabled() {
+        eprintln!(
+            "[perf]	stage={stage}	elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
+fn perf_trace_detail(stage: &str, started: Instant, detail: impl std::fmt::Display) {
+    if perf_trace_enabled() {
+        eprintln!(
+            "[perf]	stage={stage}	elapsed_ms={}	{detail}",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
+fn sqlite_table_count(tx: &Transaction<'_>, table_name: &str) -> Result<i64> {
+    let sql = format!("SELECT COUNT(*) FROM {table_name}");
+    tx.query_row(&sql, [], |row| row.get(0))
+        .with_context(|| format!("failed to count {table_name}"))
+}
+
 fn run(args: Args) -> Result<()> {
     if let Some(sqlite_path) = args.from_sqlite.as_deref() {
         if args.input_file.is_some() {
@@ -541,17 +569,32 @@ fn stream_jsonl_reader_to_outdir<R: BufRead>(
     base: &str,
     compact_output: bool,
 ) -> Result<()> {
+    let stage_started = Instant::now();
     let database = outdir.join("schemas.sqlite");
     let mut conn = Connection::open(&database)
         .with_context(|| format!("failed to open {}", database.display()))?;
+    perf_trace("stream.open_sqlite", stage_started);
+
+    let stage_started = Instant::now();
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA temp_store = FILE;",
     )?;
+    perf_trace("stream.sqlite_pragmas", stage_started);
+
+    let stage_started = Instant::now();
     create_stream_tables(&conn)?;
+    perf_trace("stream.create_temp_tables", stage_started);
+
+    let stage_started = Instant::now();
     stream_jsonl_into_temp_tables(&mut conn, reader, outdir, file_mode, base)?;
-    finalize_streamed_jsonl(&mut conn, outdir, compact_output)
+    perf_trace("stream.accumulate_and_flush_temp", stage_started);
+
+    let stage_started = Instant::now();
+    let result = finalize_streamed_jsonl(&mut conn, outdir, compact_output);
+    perf_trace("stream.finalize", stage_started);
+    result
 }
 
 fn create_stream_tables(conn: &Connection) -> Result<()> {
@@ -650,8 +693,10 @@ fn stream_jsonl_into_temp_tables<R: BufRead>(
     let mut line = String::new();
     let mut line_number = 0usize;
     let mut value_index = 0usize;
+    let mut input_bytes = 0usize;
     let mut saw_value = false;
     let mut acc = StreamAcc::default();
+    let accumulate_started = Instant::now();
 
     'records: loop {
         line.clear();
@@ -661,6 +706,7 @@ fn stream_jsonl_into_temp_tables<R: BufRead>(
         if bytes_read == 0 {
             break;
         }
+        input_bytes += bytes_read;
         line_number += 1;
 
         let record = line.trim_start_matches('\0');
@@ -704,9 +750,37 @@ fn stream_jsonl_into_temp_tables<R: BufRead>(
         }
     }
 
+    let acc_stats = acc.stats();
+    perf_trace_detail(
+        "stream.read_parse_walk",
+        accumulate_started,
+        format_args!(
+            "lines={}	values={}	input_bytes={}	{}",
+            line_number, value_index, input_bytes, acc_stats
+        ),
+    );
+
+    let flush_started = Instant::now();
     let tx = conn.transaction()?;
     acc.flush_to_sqlite(&tx)?;
+    if perf_trace_enabled() {
+        perf_trace_detail(
+            "stream.flush_acc_to_temp_tables",
+            flush_started,
+            format_args!(
+                "stream_object_totals={}	stream_object_field_facts={}	stream_array_member_facts={}	stream_item_schema_counts={}	stream_item_schema_index_refs={}	stream_item_schema_field_counts={}",
+                sqlite_table_count(&tx, "stream_object_totals")?,
+                sqlite_table_count(&tx, "stream_object_field_facts")?,
+                sqlite_table_count(&tx, "stream_array_member_facts")?,
+                sqlite_table_count(&tx, "stream_item_schema_counts")?,
+                sqlite_table_count(&tx, "stream_item_schema_index_refs")?,
+                sqlite_table_count(&tx, "stream_item_schema_field_counts")?,
+            ),
+        );
+    }
+    let commit_started = Instant::now();
     tx.commit()?;
+    perf_trace("stream.flush_acc_commit", commit_started);
 
     if !saw_value {
         bail!("input is empty");
@@ -742,7 +816,9 @@ fn record_streamed_object_occurrence(
             let schema_json = serde_json::to_string(&schema)?;
             let role_name = role_storage_name(role);
             let array_index_path = serde_json::to_string(array_indexes)?;
-            let index_path_key = index_path_sort_key(array_indexes);
+            let compact = CompactIndexPath::from_slice(array_indexes);
+            let mut index_path_key = String::new();
+            compact.write_sort_key(&mut index_path_key);
 
             tx.execute(
                 "INSERT INTO stream_item_schema_counts(role, path_base, canonical_json, schema_json, object_count) \
@@ -1020,7 +1096,43 @@ struct StreamAcc {
     item_schema_field_counts: HashMap<(String, String, String, String), i64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StreamAccStats {
+    object_totals: usize,
+    object_field_facts: usize,
+    array_member_facts: usize,
+    item_schema_counts: usize,
+    item_schema_index_refs: usize,
+    item_schema_field_counts: usize,
+}
+
+impl std::fmt::Display for StreamAccStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "acc_object_totals={}	acc_object_field_facts={}	acc_array_member_facts={}	acc_item_schema_counts={}	acc_item_schema_index_refs={}	acc_item_schema_field_counts={}",
+            self.object_totals,
+            self.object_field_facts,
+            self.array_member_facts,
+            self.item_schema_counts,
+            self.item_schema_index_refs,
+            self.item_schema_field_counts,
+        )
+    }
+}
+
 impl StreamAcc {
+    fn stats(&self) -> StreamAccStats {
+        StreamAccStats {
+            object_totals: self.object_totals.len(),
+            object_field_facts: self.object_field_facts.len(),
+            array_member_facts: self.array_member_facts.len(),
+            item_schema_counts: self.item_schema_counts.len(),
+            item_schema_index_refs: self.item_schema_index_refs.len(),
+            item_schema_field_counts: self.item_schema_field_counts.len(),
+        }
+    }
+
     fn add_object_total(&mut self, path_base: &str) {
         *self.object_totals.entry(path_base.to_string()).or_default() += 1;
     }
@@ -1095,31 +1207,44 @@ impl StreamAcc {
     }
 
     fn flush_to_sqlite(self, tx: &Transaction<'_>) -> Result<()> {
+        let section_started = Instant::now();
         let mut object_totals = self.object_totals.into_iter().collect::<Vec<_>>();
         object_totals.sort_by(|a, b| a.0.cmp(&b.0));
+        let object_totals_len = object_totals.len();
         for (path_base, object_count) in object_totals {
             tx.execute(
-                "INSERT INTO stream_object_totals(path_base, object_count) VALUES (?1, ?2) \
-                 ON CONFLICT(path_base) DO UPDATE SET object_count = object_count + excluded.object_count",
+                "INSERT INTO stream_object_totals(path_base, object_count)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(path_base) DO UPDATE SET
+                     object_count = object_count + excluded.object_count",
                 params![path_base, object_count],
             )?;
         }
+        perf_trace_detail(
+            "stream.flush.object_totals",
+            section_started,
+            format_args!("rows={object_totals_len}"),
+        );
 
+        let section_started = Instant::now();
         let mut object_field_facts = self.object_field_facts.into_iter().collect::<Vec<_>>();
         object_field_facts.sort_by(|a, b| a.0.cmp(&b.0));
+        let object_field_facts_len = object_field_facts.len();
         for ((path_base, field_name), aggregate) in object_field_facts {
             tx.execute(
-                "INSERT INTO stream_object_field_facts(\
-                 path_base, field_name, present_count, array_count, boolean_count, null_count, number_count, object_count, string_count) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-                 ON CONFLICT(path_base, field_name) DO UPDATE SET \
-                 present_count = present_count + excluded.present_count, \
-                 array_count = array_count + excluded.array_count, \
-                 boolean_count = boolean_count + excluded.boolean_count, \
-                 null_count = null_count + excluded.null_count, \
-                 number_count = number_count + excluded.number_count, \
-                 object_count = object_count + excluded.object_count, \
-                 string_count = string_count + excluded.string_count",
+                "INSERT INTO stream_object_field_facts(
+                     path_base, field_name, present_count, array_count, boolean_count,
+                     null_count, number_count, object_count, string_count
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(path_base, field_name) DO UPDATE SET
+                     present_count = present_count + excluded.present_count,
+                     array_count = array_count + excluded.array_count,
+                     boolean_count = boolean_count + excluded.boolean_count,
+                     null_count = null_count + excluded.null_count,
+                     number_count = number_count + excluded.number_count,
+                     object_count = object_count + excluded.object_count,
+                     string_count = string_count + excluded.string_count",
                 params![
                     path_base,
                     field_name,
@@ -1133,22 +1258,31 @@ impl StreamAcc {
                 ],
             )?;
         }
+        perf_trace_detail(
+            "stream.flush.object_field_facts",
+            section_started,
+            format_args!("rows={object_field_facts_len}"),
+        );
 
+        let section_started = Instant::now();
         let mut array_member_facts = self.array_member_facts.into_iter().collect::<Vec<_>>();
         array_member_facts.sort_by(|a, b| a.0.cmp(&b.0));
+        let array_member_facts_len = array_member_facts.len();
         for ((path_base, depth), aggregate) in array_member_facts {
             tx.execute(
-                "INSERT INTO stream_array_member_facts(\
-                 path_base, depth, member_count, array_count, boolean_count, null_count, number_count, object_count, string_count) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-                 ON CONFLICT(path_base, depth) DO UPDATE SET \
-                 member_count = member_count + excluded.member_count, \
-                 array_count = array_count + excluded.array_count, \
-                 boolean_count = boolean_count + excluded.boolean_count, \
-                 null_count = null_count + excluded.null_count, \
-                 number_count = number_count + excluded.number_count, \
-                 object_count = object_count + excluded.object_count, \
-                 string_count = string_count + excluded.string_count",
+                "INSERT INTO stream_array_member_facts(
+                     path_base, depth, member_count, array_count, boolean_count,
+                     null_count, number_count, object_count, string_count
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(path_base, depth) DO UPDATE SET
+                     member_count = member_count + excluded.member_count,
+                     array_count = array_count + excluded.array_count,
+                     boolean_count = boolean_count + excluded.boolean_count,
+                     null_count = null_count + excluded.null_count,
+                     number_count = number_count + excluded.number_count,
+                     object_count = object_count + excluded.object_count,
+                     string_count = string_count + excluded.string_count",
                 params![
                     path_base,
                     depth as i64,
@@ -1162,14 +1296,24 @@ impl StreamAcc {
                 ],
             )?;
         }
+        perf_trace_detail(
+            "stream.flush.array_member_facts",
+            section_started,
+            format_args!("rows={array_member_facts_len}"),
+        );
 
+        let section_started = Instant::now();
         let mut item_schema_counts = self.item_schema_counts.into_iter().collect::<Vec<_>>();
         item_schema_counts.sort_by(|a, b| a.0.cmp(&b.0));
+        let item_schema_counts_len = item_schema_counts.len();
         for ((role, path_base, canonical_json), aggregate) in item_schema_counts {
             tx.execute(
-                "INSERT INTO stream_item_schema_counts(role, path_base, canonical_json, schema_json, object_count) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(role, path_base, canonical_json) DO UPDATE SET object_count = object_count + excluded.object_count",
+                "INSERT INTO stream_item_schema_counts(
+                     role, path_base, canonical_json, schema_json, object_count
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(role, path_base, canonical_json) DO UPDATE SET
+                     object_count = object_count + excluded.object_count",
                 params![
                     role,
                     path_base,
@@ -1179,16 +1323,26 @@ impl StreamAcc {
                 ],
             )?;
         }
+        perf_trace_detail(
+            "stream.flush.item_schema_counts",
+            section_started,
+            format_args!("rows={item_schema_counts_len}"),
+        );
 
+        let section_started = Instant::now();
         let mut item_schema_index_refs =
             self.item_schema_index_refs.into_iter().collect::<Vec<_>>();
         item_schema_index_refs.sort_by(|a, b| a.0.cmp(&b.0));
+        let item_schema_index_refs_len = item_schema_index_refs.len();
         for ((role, path_base, array_index_path), aggregate) in item_schema_index_refs {
             tx.execute(
-                "INSERT INTO stream_item_schema_index_refs(role, path_base, canonical_json, array_index_path, index_path_key) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(role, path_base, array_index_path) DO UPDATE SET \
-                 canonical_json = excluded.canonical_json, index_path_key = excluded.index_path_key",
+                "INSERT INTO stream_item_schema_index_refs(
+                     role, path_base, canonical_json, array_index_path, index_path_key
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(role, path_base, array_index_path) DO UPDATE SET
+                     canonical_json = excluded.canonical_json,
+                     index_path_key = excluded.index_path_key",
                 params![
                     role,
                     path_base,
@@ -1198,21 +1352,36 @@ impl StreamAcc {
                 ],
             )?;
         }
+        perf_trace_detail(
+            "stream.flush.item_schema_index_refs",
+            section_started,
+            format_args!("rows={item_schema_index_refs_len}"),
+        );
 
+        let section_started = Instant::now();
         let mut item_schema_field_counts = self
             .item_schema_field_counts
             .into_iter()
             .collect::<Vec<_>>();
         item_schema_field_counts.sort_by(|a, b| a.0.cmp(&b.0));
+        let item_schema_field_counts_len = item_schema_field_counts.len();
         for ((role, path_base, canonical_json, field_name), field_count) in item_schema_field_counts
         {
             tx.execute(
-                "INSERT INTO stream_item_schema_field_counts(role, path_base, canonical_json, field_name, field_count) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(role, path_base, canonical_json, field_name) DO UPDATE SET field_count = field_count + excluded.field_count",
+                "INSERT INTO stream_item_schema_field_counts(
+                     role, path_base, canonical_json, field_name, field_count
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(role, path_base, canonical_json, field_name) DO UPDATE SET
+                     field_count = field_count + excluded.field_count",
                 params![role, path_base, canonical_json, field_name, field_count],
             )?;
         }
+        perf_trace_detail(
+            "stream.flush.item_schema_field_counts",
+            section_started,
+            format_args!("rows={item_schema_field_counts_len}"),
+        );
 
         Ok(())
     }
@@ -1365,14 +1534,6 @@ fn child_path_base(path_base: &str, key: &str) -> String {
     format!("{}/{}", path_base, path_segment(key))
 }
 
-fn index_path_sort_key(index_path: &[usize]) -> String {
-    index_path
-        .iter()
-        .map(|index| format!("{index:020}"))
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 fn schema_for_single_object(
     outdir: &Path,
     path_base: &str,
@@ -1441,11 +1602,45 @@ fn finalize_streamed_jsonl(
     outdir: &Path,
     compact_output: bool,
 ) -> Result<()> {
+    let tx_started = Instant::now();
     let tx = conn.transaction()?;
+    perf_trace("finalize.begin_transaction", tx_started);
+
+    let stage_started = Instant::now();
     create_schema_index_tables(&tx)?;
+    perf_trace("finalize.create_schema_index_tables", stage_started);
+
     let mut made_dirs = HashMap::<PathBuf, ()>::new();
+
+    let stage_started = Instant::now();
     write_streamed_object_records(&tx, outdir, compact_output, &mut made_dirs)?;
+    if perf_trace_enabled() {
+        perf_trace_detail(
+            "finalize.write_object_records",
+            stage_started,
+            format_args!(
+                "schema_definitions={}	schema_paths={}",
+                sqlite_table_count(&tx, "schema_definitions")?,
+                sqlite_table_count(&tx, "schema_paths")?,
+            ),
+        );
+    }
+
+    let stage_started = Instant::now();
     write_streamed_item_records(&tx, Role::ArrayItem, outdir, compact_output, &mut made_dirs)?;
+    if perf_trace_enabled() {
+        perf_trace_detail(
+            "finalize.write_array_item_records",
+            stage_started,
+            format_args!(
+                "schema_definitions={}	array_index_refs={}",
+                sqlite_table_count(&tx, "schema_definitions")?,
+                sqlite_table_count(&tx, "array_index_refs")?,
+            ),
+        );
+    }
+
+    let stage_started = Instant::now();
     write_streamed_item_records(
         &tx,
         Role::RootCollection,
@@ -1453,9 +1648,48 @@ fn finalize_streamed_jsonl(
         compact_output,
         &mut made_dirs,
     )?;
+    if perf_trace_enabled() {
+        perf_trace_detail(
+            "finalize.write_root_collection_records",
+            stage_started,
+            format_args!(
+                "schema_definitions={}	array_index_refs={}",
+                sqlite_table_count(&tx, "schema_definitions")?,
+                sqlite_table_count(&tx, "array_index_refs")?,
+            ),
+        );
+    }
+
+    let stage_started = Instant::now();
     write_streamed_occurrence_statistics(&tx)?;
+    if perf_trace_enabled() {
+        perf_trace_detail(
+            "finalize.write_occurrence_statistics",
+            stage_started,
+            format_args!(
+                "schema_object_counts={}	schema_field_counts={}",
+                sqlite_table_count(&tx, "schema_object_counts")?,
+                sqlite_table_count(&tx, "schema_field_counts")?,
+            ),
+        );
+    }
+
+    let stage_started = Instant::now();
     write_schema_relations_from_sqlite(&tx)?;
+    if perf_trace_enabled() {
+        perf_trace_detail(
+            "finalize.write_schema_relations",
+            stage_started,
+            format_args!(
+                "schema_relations={}",
+                sqlite_table_count(&tx, "schema_relations")?
+            ),
+        );
+    }
+
+    let stage_started = Instant::now();
     tx.commit()?;
+    perf_trace("finalize.commit", stage_started);
     Ok(())
 }
 
@@ -1843,13 +2077,19 @@ fn insert_streamed_array_index_refs_for_item_schema(
     path_base: &str,
     canonical: &str,
 ) -> Result<()> {
-    tx.execute(
-        "INSERT OR REPLACE INTO array_index_refs(array_path, array_index_path, schema_path) \
-         SELECT ?1, array_index_path, ?2 \
-         FROM stream_item_schema_index_refs \
-         WHERE role = ?3 AND path_base = ?4 AND canonical_json = ?5",
+    let stage_started = Instant::now();
+    let inserted = tx.execute(
+        "INSERT OR REPLACE INTO array_index_refs(array_path, array_index_path, schema_path)          SELECT ?1, array_index_path, ?2          FROM stream_item_schema_index_refs          WHERE role = ?3 AND path_base = ?4 AND canonical_json = ?5",
         params![array_path, schema_path, role_name, path_base, canonical],
     )?;
+    perf_trace_detail(
+        "finalize.insert_array_index_refs_for_schema",
+        stage_started,
+        format_args!(
+            "rows={}	role={}	path_base={}	schema_path={}",
+            inserted, role_name, path_base, schema_path
+        ),
+    );
     Ok(())
 }
 
@@ -2686,6 +2926,7 @@ fn emit_report_from_sqlite(
     summary: &ReportSummary,
     output_path: Option<&Path>,
 ) -> Result<()> {
+    let report_started = Instant::now();
     if let Some(output_path) = output_path {
         if let Some(parent) = output_path
             .parent()
@@ -2723,6 +2964,7 @@ fn emit_report_from_sqlite(
         stdout.flush()?;
     }
 
+    perf_trace("report.emit", report_started);
     Ok(())
 }
 
@@ -2740,6 +2982,7 @@ fn render_report_from_sqlite_to_writer<W: Write>(
         );
     }
 
+    let stage_started = Instant::now();
     let conn = Connection::open(database).with_context(|| {
         format!(
             "failed to open SQLite report source: {}",
@@ -2747,24 +2990,43 @@ fn render_report_from_sqlite_to_writer<W: Write>(
         )
     })?;
     ensure_field_type_column_exists(&conn)?;
+    perf_trace("report.open_sqlite", stage_started);
 
     writeln!(writer, "# dump-json-refs report")?;
     writeln!(writer)?;
+
+    let stage_started = Instant::now();
     write_schemas_section_from_sqlite(&conn, writer)?;
+    perf_trace("report.write_schemas", stage_started);
 
     match detail {
         ReportDetail::CompactStdout => {
+            let stage_started = Instant::now();
             write_fields_section_from_sqlite(&conn, writer)?;
+            perf_trace("report.write_fields", stage_started);
+
+            let stage_started = Instant::now();
             write_schema_aliases_section_from_sqlite(&conn, writer)?;
+            perf_trace("report.write_schema_aliases", stage_started);
         }
         ReportDetail::FullFile => {
+            let stage_started = Instant::now();
             write_schema_object_paths_section_from_sqlite(&conn, writer)?;
+            perf_trace("report.write_schema_object_paths", stage_started);
+
+            let stage_started = Instant::now();
             write_schema_array_index_refs_section_from_sqlite(&conn, writer)?;
+            perf_trace("report.write_schema_array_index_refs", stage_started);
+
+            let stage_started = Instant::now();
             write_fields_section_from_sqlite(&conn, writer)?;
+            perf_trace("report.write_fields", stage_started);
         }
     }
 
+    let stage_started = Instant::now();
     render_summary_from_conn_to_writer(&conn, summary, output_path, writer)?;
+    perf_trace("report.write_summary", stage_started);
     Ok(())
 }
 
@@ -2851,22 +3113,27 @@ fn write_schema_array_index_refs_section_from_sqlite<W: Write>(
     writer: &mut W,
 ) -> Result<()> {
     writeln!(writer, "[schema_array_index_refs]")?;
-    writeln!(writer, "schema_path\tarray_path\tarray_index_path")?;
+    writeln!(writer, "schema_path	array_path	array_index_path")?;
+    let query_started = Instant::now();
     let mut stmt = conn.prepare(&format!(
-        "SELECT r.schema_path, r.array_path, r.array_index_path \
-         FROM array_index_refs AS r \
-         JOIN ({}) AS schema_order ON schema_order.schema_path = r.schema_path \
-         ORDER BY schema_order.object_count DESC, r.schema_path, r.array_path, r.array_index_path",
+        "SELECT r.schema_path, r.array_path, r.array_index_path          FROM array_index_refs AS r          JOIN ({}) AS schema_order ON schema_order.schema_path = r.schema_path          ORDER BY schema_order.object_count DESC, r.schema_path, r.array_path, r.array_index_path",
         schema_order_sql()
     ))?;
     let mut rows = stmt.query([])?;
+    let mut row_count = 0usize;
     while let Some(row) = rows.next()? {
         let schema_path: String = row.get(0)?;
         let array_path: String = row.get(1)?;
         let array_index_path: String = row.get(2)?;
-        writeln!(writer, "{schema_path}\t{array_path}\t{array_index_path}")?;
+        writeln!(writer, "{schema_path}	{array_path}	{array_index_path}")?;
+        row_count += 1;
     }
     writeln!(writer)?;
+    perf_trace_detail(
+        "report.array_index_refs.query_and_write_rows",
+        query_started,
+        format_args!("rows={row_count}"),
+    );
     Ok(())
 }
 
