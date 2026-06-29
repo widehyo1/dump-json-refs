@@ -534,8 +534,6 @@ fn parse_jsonl_stream(input: &str) -> Result<Vec<Value>> {
     Ok(values)
 }
 
-const STREAM_BATCH_VALUES: usize = 1000;
-
 fn stream_jsonl_reader_to_outdir<R: BufRead>(
     reader: R,
     outdir: &Path,
@@ -652,9 +650,8 @@ fn stream_jsonl_into_temp_tables<R: BufRead>(
     let mut line = String::new();
     let mut line_number = 0usize;
     let mut value_index = 0usize;
-    let mut batch_values = 0usize;
     let mut saw_value = false;
-    let mut tx = conn.transaction()?;
+    let mut acc = StreamAcc::default();
 
     'records: loop {
         line.clear();
@@ -696,24 +693,19 @@ fn stream_jsonl_into_temp_tables<R: BufRead>(
             let array_indexes = vec![value_index];
             value_index += 1;
             saw_value = true;
-            record_streamed_object_occurrence(
-                &tx,
+            record_streamed_object_occurrence_to_acc(
+                &mut acc,
                 outdir,
                 &root_base,
                 &map,
                 Role::RootCollection,
                 &array_indexes,
             )?;
-
-            batch_values += 1;
-            if batch_values >= STREAM_BATCH_VALUES {
-                tx.commit()?;
-                tx = conn.transaction()?;
-                batch_values = 0;
-            }
         }
     }
 
+    let tx = conn.transaction()?;
+    acc.flush_to_sqlite(&tx)?;
     tx.commit()?;
 
     if !saw_value {
@@ -727,6 +719,7 @@ fn is_incomplete_trailing_jsonl_record(line: &str, error: &serde_json::Error) ->
     !line.ends_with('\n') && error.is_eof()
 }
 
+#[cfg(test)]
 fn record_streamed_object_occurrence(
     tx: &Transaction<'_>,
     outdir: &Path,
@@ -812,6 +805,7 @@ fn record_streamed_object_occurrence(
     Ok(())
 }
 
+#[cfg(test)]
 fn record_streamed_array_object_occurrences(
     tx: &Transaction<'_>,
     outdir: &Path,
@@ -845,6 +839,7 @@ fn record_streamed_array_object_occurrences(
     Ok(())
 }
 
+#[cfg(test)]
 fn record_object_field_fact(
     tx: &Transaction<'_>,
     path_base: &str,
@@ -878,6 +873,7 @@ fn record_object_field_fact(
     Ok(())
 }
 
+#[cfg(test)]
 fn record_array_member_facts(
     tx: &Transaction<'_>,
     path_base: &str,
@@ -917,7 +913,7 @@ fn record_array_member_facts(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 struct ValueTypeCounts {
     array: i64,
     boolean: i64,
@@ -981,6 +977,15 @@ impl ValueTypeCounts {
         }
     }
 
+    fn add(&mut self, other: Self) {
+        self.array += other.array;
+        self.boolean += other.boolean;
+        self.null += other.null;
+        self.number += other.number;
+        self.object += other.object;
+        self.string += other.string;
+    }
+
     fn type_names(self) -> Vec<&'static str> {
         let mut out = Vec::new();
         if self.array > 0 {
@@ -1002,6 +1007,336 @@ impl ValueTypeCounts {
             out.push("string");
         }
         out
+    }
+}
+
+#[derive(Debug, Default)]
+struct StreamAcc {
+    object_totals: HashMap<String, i64>,
+    object_field_facts: HashMap<(String, String), ObjectFieldAggregate>,
+    array_member_facts: HashMap<(String, usize), ArrayMemberAggregate>,
+    item_schema_counts: HashMap<(String, String, String), ItemSchemaCountAggregate>,
+    item_schema_index_refs: HashMap<(String, String, String), ItemSchemaIndexRefAggregate>,
+    item_schema_field_counts: HashMap<(String, String, String, String), i64>,
+}
+
+impl StreamAcc {
+    fn add_object_total(&mut self, path_base: &str) {
+        *self.object_totals.entry(path_base.to_string()).or_default() += 1;
+    }
+
+    fn add_object_field_fact(&mut self, path_base: &str, field_name: &str, value: &Value) {
+        let aggregate = self
+            .object_field_facts
+            .entry((path_base.to_string(), field_name.to_string()))
+            .or_default();
+        aggregate.present_count += 1;
+        aggregate.counts.add(ValueTypeCounts::single(value));
+    }
+
+    fn add_array_member_fact(&mut self, path_base: &str, depth: usize, value: &Value) {
+        let aggregate = self
+            .array_member_facts
+            .entry((path_base.to_string(), depth))
+            .or_default();
+        aggregate.member_count += 1;
+        aggregate.counts.add(ValueTypeCounts::single(value));
+    }
+
+    fn add_item_schema(
+        &mut self,
+        role: Role,
+        path_base: &str,
+        object: &Map<String, Value>,
+        outdir: &Path,
+        array_indexes: &[usize],
+    ) -> Result<()> {
+        let schema = schema_for_single_object(outdir, path_base, object)?;
+        let canonical_json = canonical_json(&schema)?;
+        let schema_json = serde_json::to_string(&schema)?;
+        let role_name = role_storage_name(role).to_string();
+        let path_base = path_base.to_string();
+        let key = (role_name.clone(), path_base.clone(), canonical_json.clone());
+        let count =
+            self.item_schema_counts
+                .entry(key)
+                .or_insert_with(|| ItemSchemaCountAggregate {
+                    schema_json: schema_json.clone(),
+                    object_count: 0,
+                });
+        count.object_count += 1;
+
+        let array_index_path = serde_json::to_string(array_indexes)?;
+        self.item_schema_index_refs.insert(
+            (
+                role_name.clone(),
+                path_base.clone(),
+                array_index_path.clone(),
+            ),
+            ItemSchemaIndexRefAggregate {
+                canonical_json: canonical_json.clone(),
+                index_path_key: index_path_sort_key(array_indexes),
+            },
+        );
+
+        for field_name in object.keys() {
+            *self
+                .item_schema_field_counts
+                .entry((
+                    role_name.clone(),
+                    path_base.clone(),
+                    canonical_json.clone(),
+                    field_name.clone(),
+                ))
+                .or_default() += 1;
+        }
+
+        Ok(())
+    }
+
+    fn flush_to_sqlite(self, tx: &Transaction<'_>) -> Result<()> {
+        let mut object_totals = self.object_totals.into_iter().collect::<Vec<_>>();
+        object_totals.sort_by(|a, b| a.0.cmp(&b.0));
+        for (path_base, object_count) in object_totals {
+            tx.execute(
+                "INSERT INTO stream_object_totals(path_base, object_count) VALUES (?1, ?2) \
+                 ON CONFLICT(path_base) DO UPDATE SET object_count = object_count + excluded.object_count",
+                params![path_base, object_count],
+            )?;
+        }
+
+        let mut object_field_facts = self.object_field_facts.into_iter().collect::<Vec<_>>();
+        object_field_facts.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((path_base, field_name), aggregate) in object_field_facts {
+            tx.execute(
+                "INSERT INTO stream_object_field_facts(\
+                 path_base, field_name, present_count, array_count, boolean_count, null_count, number_count, object_count, string_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(path_base, field_name) DO UPDATE SET \
+                 present_count = present_count + excluded.present_count, \
+                 array_count = array_count + excluded.array_count, \
+                 boolean_count = boolean_count + excluded.boolean_count, \
+                 null_count = null_count + excluded.null_count, \
+                 number_count = number_count + excluded.number_count, \
+                 object_count = object_count + excluded.object_count, \
+                 string_count = string_count + excluded.string_count",
+                params![
+                    path_base,
+                    field_name,
+                    aggregate.present_count,
+                    aggregate.counts.array,
+                    aggregate.counts.boolean,
+                    aggregate.counts.null,
+                    aggregate.counts.number,
+                    aggregate.counts.object,
+                    aggregate.counts.string,
+                ],
+            )?;
+        }
+
+        let mut array_member_facts = self.array_member_facts.into_iter().collect::<Vec<_>>();
+        array_member_facts.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((path_base, depth), aggregate) in array_member_facts {
+            tx.execute(
+                "INSERT INTO stream_array_member_facts(\
+                 path_base, depth, member_count, array_count, boolean_count, null_count, number_count, object_count, string_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(path_base, depth) DO UPDATE SET \
+                 member_count = member_count + excluded.member_count, \
+                 array_count = array_count + excluded.array_count, \
+                 boolean_count = boolean_count + excluded.boolean_count, \
+                 null_count = null_count + excluded.null_count, \
+                 number_count = number_count + excluded.number_count, \
+                 object_count = object_count + excluded.object_count, \
+                 string_count = string_count + excluded.string_count",
+                params![
+                    path_base,
+                    depth as i64,
+                    aggregate.member_count,
+                    aggregate.counts.array,
+                    aggregate.counts.boolean,
+                    aggregate.counts.null,
+                    aggregate.counts.number,
+                    aggregate.counts.object,
+                    aggregate.counts.string,
+                ],
+            )?;
+        }
+
+        let mut item_schema_counts = self.item_schema_counts.into_iter().collect::<Vec<_>>();
+        item_schema_counts.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((role, path_base, canonical_json), aggregate) in item_schema_counts {
+            tx.execute(
+                "INSERT INTO stream_item_schema_counts(role, path_base, canonical_json, schema_json, object_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(role, path_base, canonical_json) DO UPDATE SET object_count = object_count + excluded.object_count",
+                params![
+                    role,
+                    path_base,
+                    canonical_json,
+                    aggregate.schema_json,
+                    aggregate.object_count,
+                ],
+            )?;
+        }
+
+        let mut item_schema_index_refs =
+            self.item_schema_index_refs.into_iter().collect::<Vec<_>>();
+        item_schema_index_refs.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((role, path_base, array_index_path), aggregate) in item_schema_index_refs {
+            tx.execute(
+                "INSERT INTO stream_item_schema_index_refs(role, path_base, canonical_json, array_index_path, index_path_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(role, path_base, array_index_path) DO UPDATE SET \
+                 canonical_json = excluded.canonical_json, index_path_key = excluded.index_path_key",
+                params![
+                    role,
+                    path_base,
+                    aggregate.canonical_json,
+                    array_index_path,
+                    aggregate.index_path_key,
+                ],
+            )?;
+        }
+
+        let mut item_schema_field_counts = self
+            .item_schema_field_counts
+            .into_iter()
+            .collect::<Vec<_>>();
+        item_schema_field_counts.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((role, path_base, canonical_json, field_name), field_count) in item_schema_field_counts
+        {
+            tx.execute(
+                "INSERT INTO stream_item_schema_field_counts(role, path_base, canonical_json, field_name, field_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(role, path_base, canonical_json, field_name) DO UPDATE SET field_count = field_count + excluded.field_count",
+                params![role, path_base, canonical_json, field_name, field_count],
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct ObjectFieldAggregate {
+    present_count: i64,
+    counts: ValueTypeCounts,
+}
+
+#[derive(Debug, Default)]
+struct ArrayMemberAggregate {
+    member_count: i64,
+    counts: ValueTypeCounts,
+}
+
+#[derive(Debug)]
+struct ItemSchemaCountAggregate {
+    schema_json: String,
+    object_count: i64,
+}
+
+#[derive(Debug)]
+struct ItemSchemaIndexRefAggregate {
+    canonical_json: String,
+    index_path_key: String,
+}
+
+fn record_streamed_object_occurrence_to_acc(
+    acc: &mut StreamAcc,
+    outdir: &Path,
+    path_base: &str,
+    object: &Map<String, Value>,
+    role: Role,
+    array_indexes: &[usize],
+) -> Result<()> {
+    match role {
+        Role::Object => acc.add_object_total(path_base),
+        Role::ArrayItem | Role::RootCollection => {
+            acc.add_item_schema(role, path_base, object, outdir, array_indexes)?;
+        }
+    }
+
+    for (key, child) in object {
+        let child_base = child_path_base(path_base, key);
+        if role == Role::Object {
+            acc.add_object_field_fact(path_base, key, child);
+            if let Value::Array(items) = child {
+                record_array_member_facts_to_acc(acc, &child_base, 0, items);
+            }
+        }
+
+        match child {
+            Value::Object(map) => {
+                record_streamed_object_occurrence_to_acc(
+                    acc,
+                    outdir,
+                    &child_base,
+                    map,
+                    Role::Object,
+                    array_indexes,
+                )?;
+            }
+            Value::Array(items) => {
+                record_streamed_array_object_occurrences_to_acc(
+                    acc,
+                    outdir,
+                    &child_base,
+                    items,
+                    array_indexes,
+                )?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn record_streamed_array_object_occurrences_to_acc(
+    acc: &mut StreamAcc,
+    outdir: &Path,
+    path_base: &str,
+    items: &[Value],
+    array_indexes: &[usize],
+) -> Result<()> {
+    for (index, item) in items.iter().enumerate() {
+        let mut item_indexes = array_indexes.to_vec();
+        item_indexes.push(index);
+        match item {
+            Value::Object(map) => record_streamed_object_occurrence_to_acc(
+                acc,
+                outdir,
+                path_base,
+                map,
+                Role::ArrayItem,
+                &item_indexes,
+            )?,
+            Value::Array(nested) => record_streamed_array_object_occurrences_to_acc(
+                acc,
+                outdir,
+                path_base,
+                nested,
+                &item_indexes,
+            )?,
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn record_array_member_facts_to_acc(
+    acc: &mut StreamAcc,
+    path_base: &str,
+    depth: usize,
+    members: &[Value],
+) {
+    for member in members {
+        acc.add_array_member_fact(path_base, depth, member);
+        if let Value::Array(nested) = member {
+            record_array_member_facts_to_acc(acc, path_base, depth + 1, nested);
+        }
     }
 }
 
@@ -1434,7 +1769,7 @@ fn write_streamed_item_records(
                 tx,
                 &container_path,
                 &container_json,
-                &[container_path.clone()],
+                std::slice::from_ref(&container_path),
                 compact_output,
                 made_dirs,
             )?;
@@ -4548,6 +4883,59 @@ mod tests {
         fs::remove_dir_all(truncated_outdir).unwrap();
     }
 
+    #[test]
+    fn stream_acc_flush_matches_existing_sqlite_upsert_path() {
+        let root_base = "refs/root_item";
+        let object = object(json!({
+            "kind": "event",
+            "payload": {
+                "id": 1,
+                "items": [{"sku": "a"}, {"sku": "b", "qty": 2}],
+                "matrix": [[{"nested": true}]]
+            }
+        }));
+        let array_indexes = vec![7];
+
+        let mut legacy_conn = Connection::open_in_memory().unwrap();
+        create_stream_tables(&legacy_conn).unwrap();
+        {
+            let tx = legacy_conn.transaction().unwrap();
+            record_streamed_object_occurrence(
+                &tx,
+                Path::new("refs"),
+                root_base,
+                &object,
+                Role::RootCollection,
+                &array_indexes,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut acc_conn = Connection::open_in_memory().unwrap();
+        create_stream_tables(&acc_conn).unwrap();
+        let mut acc = StreamAcc::default();
+        record_streamed_object_occurrence_to_acc(
+            &mut acc,
+            Path::new("refs"),
+            root_base,
+            &object,
+            Role::RootCollection,
+            &array_indexes,
+        )
+        .unwrap();
+        {
+            let tx = acc_conn.transaction().unwrap();
+            acc.flush_to_sqlite(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+
+        assert_eq!(
+            dump_stream_rows_for_test(&legacy_conn).unwrap(),
+            dump_stream_rows_for_test(&acc_conn).unwrap()
+        );
+    }
+
     fn dump_index_rows_for_test(conn: &Connection) -> Result<String> {
         let mut out = String::new();
         for sql in [
@@ -4557,6 +4945,37 @@ mod tests {
             "SELECT 'schema_object_counts', schema_path, object_count FROM schema_object_counts ORDER BY schema_path",
             "SELECT 'schema_field_counts', schema_path, field_name, field_type, field_count FROM schema_field_counts ORDER BY schema_path, field_name, field_type",
             "SELECT 'schema_relations', from_schema_path, to_schema_path, relation_kind, fk_owner, fk_candidate, field_name, field_type, cardinality, required, mixed, nested_array_depth, COALESCE(via_schema_path, ''), COALESCE(via_array_path, ''), parent_schema_path, child_schema_path, parent_object_count, child_object_count, field_count FROM schema_relations ORDER BY from_schema_path, to_schema_path, relation_kind, field_name, field_type, COALESCE(via_schema_path, ''), COALESCE(via_array_path, '')",
+        ] {
+            let mut stmt = conn.prepare(sql)?;
+            let column_count = stmt.column_count();
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                for index in 0..column_count {
+                    if index > 0 {
+                        out.push('\t');
+                    }
+                    let value = row
+                        .get_ref(index)?
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|_| row.get::<_, i64>(index).map(|value| value.to_string()))?;
+                    out.push_str(&value);
+                }
+                out.push('\n');
+            }
+        }
+        Ok(out)
+    }
+
+    fn dump_stream_rows_for_test(conn: &Connection) -> Result<String> {
+        let mut out = String::new();
+        for sql in [
+            "SELECT 'stream_object_totals', path_base, object_count FROM stream_object_totals ORDER BY path_base",
+            "SELECT 'stream_object_field_facts', path_base, field_name, present_count, array_count, boolean_count, null_count, number_count, object_count, string_count FROM stream_object_field_facts ORDER BY path_base, field_name",
+            "SELECT 'stream_array_member_facts', path_base, depth, member_count, array_count, boolean_count, null_count, number_count, object_count, string_count FROM stream_array_member_facts ORDER BY path_base, depth",
+            "SELECT 'stream_item_schema_counts', role, path_base, canonical_json, schema_json, object_count FROM stream_item_schema_counts ORDER BY role, path_base, canonical_json",
+            "SELECT 'stream_item_schema_index_refs', role, path_base, canonical_json, array_index_path, index_path_key FROM stream_item_schema_index_refs ORDER BY role, path_base, array_index_path",
+            "SELECT 'stream_item_schema_field_counts', role, path_base, canonical_json, field_name, field_count FROM stream_item_schema_field_counts ORDER BY role, path_base, canonical_json, field_name",
         ] {
             let mut stmt = conn.prepare(sql)?;
             let column_count = stmt.column_count();
