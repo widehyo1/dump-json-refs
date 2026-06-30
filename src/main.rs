@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
+use lasso::{Rodeo, Spur};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -119,7 +120,7 @@ struct Entry {
     value: Map<String, Value>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Role {
     Object,
     ArrayItem,
@@ -1117,20 +1118,84 @@ impl ValueTypeCounts {
     }
 }
 
-#[derive(Debug, Default)]
-struct StreamAcc {
-    object_totals: HashMap<String, i64>,
-    object_field_facts: HashMap<(String, String), ObjectFieldAggregate>,
-    array_member_facts: HashMap<(String, usize), ArrayMemberAggregate>,
-    item_schema_counts: HashMap<(String, String, String), ItemSchemaCountAggregate>,
-    item_schema_index_refs: HashMap<ItemSchemaIndexRefKey, ItemSchemaIndexRefAggregate>,
-    item_schema_field_counts: HashMap<(String, String, String, String), i64>,
+type PathId = Spur;
+type FieldId = Spur;
+type SegmentId = Spur;
+
+#[derive(Default)]
+struct StreamInterns {
+    paths: Rodeo,
+    fields: Rodeo,
+    segments: Rodeo,
+    field_segments: HashMap<FieldId, SegmentId>,
+    child_paths: HashMap<(PathId, SegmentId), PathId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+impl StreamInterns {
+    fn intern_path(&mut self, path: &str) -> PathId {
+        self.paths.get_or_intern(path)
+    }
+
+    fn intern_field(&mut self, field_name: &str) -> FieldId {
+        self.fields.get_or_intern(field_name)
+    }
+
+    fn resolve_path(&self, path_id: PathId) -> &str {
+        self.paths.resolve(&path_id)
+    }
+
+    fn resolve_field(&self, field_id: FieldId) -> &str {
+        self.fields.resolve(&field_id)
+    }
+
+    fn resolve_segment(&self, segment_id: SegmentId) -> &str {
+        self.segments.resolve(&segment_id)
+    }
+
+    fn intern_escaped_segment_for_field(&mut self, field_id: FieldId) -> SegmentId {
+        if let Some(&segment_id) = self.field_segments.get(&field_id) {
+            return segment_id;
+        }
+
+        let escaped = path_segment(self.resolve_field(field_id));
+        let segment_id = self.segments.get_or_intern(escaped);
+        self.field_segments.insert(field_id, segment_id);
+        segment_id
+    }
+
+    fn child_path(&mut self, parent: PathId, field_id: FieldId) -> PathId {
+        let segment_id = self.intern_escaped_segment_for_field(field_id);
+        if let Some(&child_path_id) = self.child_paths.get(&(parent, segment_id)) {
+            return child_path_id;
+        }
+
+        let mut path = String::with_capacity(
+            self.resolve_path(parent).len() + 1 + self.resolve_segment(segment_id).len(),
+        );
+        path.push_str(self.resolve_path(parent));
+        path.push('/');
+        path.push_str(self.resolve_segment(segment_id));
+        let child_path_id = self.paths.get_or_intern(path);
+        self.child_paths.insert((parent, segment_id), child_path_id);
+        child_path_id
+    }
+}
+
+#[derive(Default)]
+struct StreamAcc {
+    interns: StreamInterns,
+    object_totals: HashMap<PathId, i64>,
+    object_field_facts: HashMap<(PathId, FieldId), ObjectFieldAggregate>,
+    array_member_facts: HashMap<(PathId, usize), ArrayMemberAggregate>,
+    item_schema_counts: HashMap<(Role, PathId, String), ItemSchemaCountAggregate>,
+    item_schema_index_refs: HashMap<ItemSchemaIndexRefKey, ItemSchemaIndexRefAggregate>,
+    item_schema_field_counts: HashMap<(Role, PathId, String, FieldId), i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ItemSchemaIndexRefKey {
-    role: String,
-    path_base: String,
+    role: Role,
+    path_base: PathId,
     index_path: CompactIndexPath,
 }
 
@@ -1189,8 +1254,8 @@ impl CompactIndexPath {
                 out.push_str(&c.to_string());
             }
             Self::Many(indexes) => {
-                for (idx, index) in indexes.iter().enumerate() {
-                    if idx > 0 {
+                for (position, index) in indexes.iter().enumerate() {
+                    if position > 0 {
                         out.push(',');
                     }
                     out.push_str(&index.to_string());
@@ -1215,8 +1280,8 @@ impl CompactIndexPath {
                 push_padded_index(out, *c);
             }
             Self::Many(indexes) => {
-                for (idx, index) in indexes.iter().enumerate() {
-                    if idx > 0 {
+                for (position, index) in indexes.iter().enumerate() {
+                    if position > 0 {
                         out.push('/');
                     }
                     push_padded_index(out, *index);
@@ -1227,11 +1292,11 @@ impl CompactIndexPath {
 }
 
 fn push_padded_index(out: &mut String, index: usize) {
-    use std::fmt::Write as _;
+    use std::fmt::Write;
     let _ = write!(out, "{index:020}");
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct StreamAccStats {
     object_totals: usize,
     object_field_facts: usize,
@@ -1245,18 +1310,28 @@ impl std::fmt::Display for StreamAccStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "acc_object_totals={}	acc_object_field_facts={}	acc_array_member_facts={}	acc_item_schema_counts={}	acc_item_schema_index_refs={}	acc_item_schema_field_counts={}",
+            "acc_object_totals={}\tacc_object_field_facts={}\tacc_array_member_facts={}\tacc_item_schema_counts={}\tacc_item_schema_index_refs={}\tacc_item_schema_field_counts={}",
             self.object_totals,
             self.object_field_facts,
             self.array_member_facts,
             self.item_schema_counts,
             self.item_schema_index_refs,
-            self.item_schema_field_counts,
+            self.item_schema_field_counts
         )
     }
 }
 
 impl StreamAcc {
+    fn intern_path(&mut self, path: &str) -> PathId {
+        self.interns.intern_path(path)
+    }
+
+    fn child_path(&mut self, parent: PathId, field_name: &str) -> (PathId, FieldId) {
+        let field_id = self.interns.intern_field(field_name);
+        let child_path = self.interns.child_path(parent, field_id);
+        (child_path, field_id)
+    }
+
     fn stats(&self) -> StreamAccStats {
         StreamAccStats {
             object_totals: self.object_totals.len(),
@@ -1268,23 +1343,23 @@ impl StreamAcc {
         }
     }
 
-    fn add_object_total(&mut self, path_base: &str) {
-        *self.object_totals.entry(path_base.to_string()).or_default() += 1;
+    fn add_object_total(&mut self, path_base: PathId) {
+        *self.object_totals.entry(path_base).or_default() += 1;
     }
 
-    fn add_object_field_fact(&mut self, path_base: &str, field_name: &str, value: &Value) {
+    fn add_object_field_fact(&mut self, path_base: PathId, field_id: FieldId, value: &Value) {
         let aggregate = self
             .object_field_facts
-            .entry((path_base.to_string(), field_name.to_string()))
+            .entry((path_base, field_id))
             .or_default();
         aggregate.present_count += 1;
         aggregate.counts.add(ValueTypeCounts::single(value));
     }
 
-    fn add_array_member_fact(&mut self, path_base: &str, depth: usize, value: &Value) {
+    fn add_array_member_fact(&mut self, path_base: PathId, depth: usize, value: &Value) {
         let aggregate = self
             .array_member_facts
-            .entry((path_base.to_string(), depth))
+            .entry((path_base, depth))
             .or_default();
         aggregate.member_count += 1;
         aggregate.counts.add(ValueTypeCounts::single(value));
@@ -1293,17 +1368,16 @@ impl StreamAcc {
     fn add_item_schema(
         &mut self,
         role: Role,
-        path_base: &str,
+        path_base: PathId,
         object: &Map<String, Value>,
         outdir: &Path,
         array_indexes: &[usize],
     ) -> Result<()> {
-        let schema = schema_for_single_object(outdir, path_base, object)?;
+        let path_base_text = self.interns.resolve_path(path_base).to_string();
+        let schema = schema_for_single_object(outdir, &path_base_text, object)?;
         let canonical_json = canonical_json(&schema)?;
         let schema_json = serde_json::to_string(&schema)?;
-        let role_name = role_storage_name(role).to_string();
-        let path_base = path_base.to_string();
-        let key = (role_name.clone(), path_base.clone(), canonical_json.clone());
+        let key = (role, path_base, canonical_json.clone());
         let count =
             self.item_schema_counts
                 .entry(key)
@@ -1314,8 +1388,8 @@ impl StreamAcc {
         count.object_count += 1;
 
         let index_ref_key = ItemSchemaIndexRefKey {
-            role: role_name.clone(),
-            path_base: path_base.clone(),
+            role,
+            path_base,
             index_path: CompactIndexPath::from_slice(array_indexes),
         };
         self.item_schema_index_refs.insert(
@@ -1326,14 +1400,10 @@ impl StreamAcc {
         );
 
         for field_name in object.keys() {
+            let field_id = self.interns.intern_field(field_name);
             *self
                 .item_schema_field_counts
-                .entry((
-                    role_name.clone(),
-                    path_base.clone(),
-                    canonical_json.clone(),
-                    field_name.clone(),
-                ))
+                .entry((role, path_base, canonical_json.clone(), field_id))
                 .or_default() += 1;
         }
 
@@ -1341,9 +1411,19 @@ impl StreamAcc {
     }
 
     fn flush_to_sqlite(self, tx: &Transaction<'_>) -> Result<()> {
+        let StreamAcc {
+            interns,
+            object_totals,
+            object_field_facts,
+            array_member_facts,
+            item_schema_counts,
+            item_schema_index_refs,
+            item_schema_field_counts,
+        } = self;
+
         let section_started = Instant::now();
-        let mut object_totals = self.object_totals.into_iter().collect::<Vec<_>>();
-        object_totals.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut object_totals = object_totals.into_iter().collect::<Vec<_>>();
+        object_totals.sort_by(|a, b| interns.resolve_path(a.0).cmp(interns.resolve_path(b.0)));
         let object_totals_len = object_totals.len();
         for (path_base, object_count) in object_totals {
             tx.execute(
@@ -1351,7 +1431,7 @@ impl StreamAcc {
                  VALUES (?1, ?2)
                  ON CONFLICT(path_base) DO UPDATE SET
                      object_count = object_count + excluded.object_count",
-                params![path_base, object_count],
+                params![interns.resolve_path(path_base), object_count],
             )?;
         }
         perf_trace_detail(
@@ -1361,8 +1441,17 @@ impl StreamAcc {
         );
 
         let section_started = Instant::now();
-        let mut object_field_facts = self.object_field_facts.into_iter().collect::<Vec<_>>();
-        object_field_facts.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut object_field_facts = object_field_facts.into_iter().collect::<Vec<_>>();
+        object_field_facts.sort_by(|a, b| {
+            interns
+                .resolve_path((a.0).0)
+                .cmp(interns.resolve_path((b.0).0))
+                .then_with(|| {
+                    interns
+                        .resolve_field((a.0).1)
+                        .cmp(interns.resolve_field((b.0).1))
+                })
+        });
         let object_field_facts_len = object_field_facts.len();
         for ((path_base, field_name), aggregate) in object_field_facts {
             tx.execute(
@@ -1380,8 +1469,8 @@ impl StreamAcc {
                      object_count = object_count + excluded.object_count,
                      string_count = string_count + excluded.string_count",
                 params![
-                    path_base,
-                    field_name,
+                    interns.resolve_path(path_base),
+                    interns.resolve_field(field_name),
                     aggregate.present_count,
                     aggregate.counts.array,
                     aggregate.counts.boolean,
@@ -1399,8 +1488,13 @@ impl StreamAcc {
         );
 
         let section_started = Instant::now();
-        let mut array_member_facts = self.array_member_facts.into_iter().collect::<Vec<_>>();
-        array_member_facts.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut array_member_facts = array_member_facts.into_iter().collect::<Vec<_>>();
+        array_member_facts.sort_by(|a, b| {
+            interns
+                .resolve_path((a.0).0)
+                .cmp(interns.resolve_path((b.0).0))
+                .then_with(|| (a.0).1.cmp(&(b.0).1))
+        });
         let array_member_facts_len = array_member_facts.len();
         for ((path_base, depth), aggregate) in array_member_facts {
             tx.execute(
@@ -1418,7 +1512,7 @@ impl StreamAcc {
                      object_count = object_count + excluded.object_count,
                      string_count = string_count + excluded.string_count",
                 params![
-                    path_base,
+                    interns.resolve_path(path_base),
                     depth as i64,
                     aggregate.member_count,
                     aggregate.counts.array,
@@ -1437,8 +1531,17 @@ impl StreamAcc {
         );
 
         let section_started = Instant::now();
-        let mut item_schema_counts = self.item_schema_counts.into_iter().collect::<Vec<_>>();
-        item_schema_counts.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut item_schema_counts = item_schema_counts.into_iter().collect::<Vec<_>>();
+        item_schema_counts.sort_by(|a, b| {
+            role_storage_name((a.0).0)
+                .cmp(role_storage_name((b.0).0))
+                .then_with(|| {
+                    interns
+                        .resolve_path((a.0).1)
+                        .cmp(interns.resolve_path((b.0).1))
+                })
+                .then_with(|| (a.0).2.cmp(&(b.0).2))
+        });
         let item_schema_counts_len = item_schema_counts.len();
         for ((role, path_base, canonical_json), aggregate) in item_schema_counts {
             tx.execute(
@@ -1449,8 +1552,8 @@ impl StreamAcc {
                  ON CONFLICT(role, path_base, canonical_json) DO UPDATE SET
                      object_count = object_count + excluded.object_count",
                 params![
-                    role,
-                    path_base,
+                    role_storage_name(role),
+                    interns.resolve_path(path_base),
                     canonical_json,
                     aggregate.schema_json,
                     aggregate.object_count,
@@ -1464,11 +1567,19 @@ impl StreamAcc {
         );
 
         let section_started = Instant::now();
-        let mut item_schema_index_refs =
-            self.item_schema_index_refs.into_iter().collect::<Vec<_>>();
+        let mut item_schema_index_refs = item_schema_index_refs.into_iter().collect::<Vec<_>>();
         let item_schema_index_refs_len = item_schema_index_refs.len();
         let sort_started = Instant::now();
-        item_schema_index_refs.sort_by(|a, b| a.0.cmp(&b.0));
+        item_schema_index_refs.sort_by(|a, b| {
+            role_storage_name(a.0.role)
+                .cmp(role_storage_name(b.0.role))
+                .then_with(|| {
+                    interns
+                        .resolve_path(a.0.path_base)
+                        .cmp(interns.resolve_path(b.0.path_base))
+                })
+                .then_with(|| a.0.index_path.cmp(&b.0.index_path))
+        });
         perf_trace_detail(
             "stream.flush.item_schema_index_refs.sort",
             sort_started,
@@ -1506,8 +1617,8 @@ impl StreamAcc {
             key.index_path.write_json_string(&mut array_index_path);
             key.index_path.write_sort_key(&mut index_path_key);
             stmt.execute(params![
-                key.role,
-                key.path_base,
+                role_storage_name(key.role),
+                interns.resolve_path(key.path_base),
                 aggregate.canonical_json,
                 &array_index_path,
                 &index_path_key,
@@ -1518,7 +1629,7 @@ impl StreamAcc {
             "stream.flush.item_schema_index_refs.insert",
             insert_started,
             format_args!(
-                "rows={item_schema_index_refs_len}	len1={compact_len_one}	len2={compact_len_two}	len3={compact_len_three}	len_many={compact_len_many}	total_index_depth={total_index_depth}	max_index_depth={max_index_depth}"
+                "rows={item_schema_index_refs_len}\tlen1={compact_len_one}\tlen2={compact_len_two}\tlen3={compact_len_three}\tlen_many={compact_len_many}\ttotal_index_depth={total_index_depth}\tmax_index_depth={max_index_depth}"
             ),
         );
         perf_trace_detail(
@@ -1528,11 +1639,22 @@ impl StreamAcc {
         );
 
         let section_started = Instant::now();
-        let mut item_schema_field_counts = self
-            .item_schema_field_counts
-            .into_iter()
-            .collect::<Vec<_>>();
-        item_schema_field_counts.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut item_schema_field_counts = item_schema_field_counts.into_iter().collect::<Vec<_>>();
+        item_schema_field_counts.sort_by(|a, b| {
+            role_storage_name((a.0).0)
+                .cmp(role_storage_name((b.0).0))
+                .then_with(|| {
+                    interns
+                        .resolve_path((a.0).1)
+                        .cmp(interns.resolve_path((b.0).1))
+                })
+                .then_with(|| (a.0).2.cmp(&(b.0).2))
+                .then_with(|| {
+                    interns
+                        .resolve_field((a.0).3)
+                        .cmp(interns.resolve_field((b.0).3))
+                })
+        });
         let item_schema_field_counts_len = item_schema_field_counts.len();
         for ((role, path_base, canonical_json, field_name), field_count) in item_schema_field_counts
         {
@@ -1543,7 +1665,13 @@ impl StreamAcc {
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(role, path_base, canonical_json, field_name) DO UPDATE SET
                      field_count = field_count + excluded.field_count",
-                params![role, path_base, canonical_json, field_name, field_count],
+                params![
+                    role_storage_name(role),
+                    interns.resolve_path(path_base),
+                    canonical_json,
+                    interns.resolve_field(field_name),
+                    field_count,
+                ],
             )?;
         }
         perf_trace_detail(
@@ -1587,6 +1715,18 @@ fn record_streamed_object_occurrence_to_acc(
     role: Role,
     array_indexes: &[usize],
 ) -> Result<()> {
+    let path_base = acc.intern_path(path_base);
+    record_streamed_object_occurrence_to_acc_id(acc, outdir, path_base, object, role, array_indexes)
+}
+
+fn record_streamed_object_occurrence_to_acc_id(
+    acc: &mut StreamAcc,
+    outdir: &Path,
+    path_base: PathId,
+    object: &Map<String, Value>,
+    role: Role,
+    array_indexes: &[usize],
+) -> Result<()> {
     match role {
         Role::Object => acc.add_object_total(path_base),
         Role::ArrayItem | Role::RootCollection => {
@@ -1595,30 +1735,30 @@ fn record_streamed_object_occurrence_to_acc(
     }
 
     for (key, child) in object {
-        let child_base = child_path_base(path_base, key);
+        let (child_base, field_id) = acc.child_path(path_base, key);
         if role == Role::Object {
-            acc.add_object_field_fact(path_base, key, child);
+            acc.add_object_field_fact(path_base, field_id, child);
             if let Value::Array(items) = child {
-                record_array_member_facts_to_acc(acc, &child_base, 0, items);
+                record_array_member_facts_to_acc_id(acc, child_base, 0, items);
             }
         }
 
         match child {
             Value::Object(map) => {
-                record_streamed_object_occurrence_to_acc(
+                record_streamed_object_occurrence_to_acc_id(
                     acc,
                     outdir,
-                    &child_base,
+                    child_base,
                     map,
                     Role::Object,
                     array_indexes,
                 )?;
             }
             Value::Array(items) => {
-                record_streamed_array_object_occurrences_to_acc(
+                record_streamed_array_object_occurrences_to_acc_id(
                     acc,
                     outdir,
-                    &child_base,
+                    child_base,
                     items,
                     array_indexes,
                 )?;
@@ -1630,10 +1770,10 @@ fn record_streamed_object_occurrence_to_acc(
     Ok(())
 }
 
-fn record_streamed_array_object_occurrences_to_acc(
+fn record_streamed_array_object_occurrences_to_acc_id(
     acc: &mut StreamAcc,
     outdir: &Path,
-    path_base: &str,
+    path_base: PathId,
     items: &[Value],
     array_indexes: &[usize],
 ) -> Result<()> {
@@ -1641,7 +1781,7 @@ fn record_streamed_array_object_occurrences_to_acc(
         let mut item_indexes = array_indexes.to_vec();
         item_indexes.push(index);
         match item {
-            Value::Object(map) => record_streamed_object_occurrence_to_acc(
+            Value::Object(map) => record_streamed_object_occurrence_to_acc_id(
                 acc,
                 outdir,
                 path_base,
@@ -1649,7 +1789,7 @@ fn record_streamed_array_object_occurrences_to_acc(
                 Role::ArrayItem,
                 &item_indexes,
             )?,
-            Value::Array(nested) => record_streamed_array_object_occurrences_to_acc(
+            Value::Array(nested) => record_streamed_array_object_occurrences_to_acc_id(
                 acc,
                 outdir,
                 path_base,
@@ -1663,16 +1803,16 @@ fn record_streamed_array_object_occurrences_to_acc(
     Ok(())
 }
 
-fn record_array_member_facts_to_acc(
+fn record_array_member_facts_to_acc_id(
     acc: &mut StreamAcc,
-    path_base: &str,
+    path_base: PathId,
     depth: usize,
     members: &[Value],
 ) {
     for member in members {
         acc.add_array_member_fact(path_base, depth, member);
         if let Value::Array(nested) = member {
-            record_array_member_facts_to_acc(acc, path_base, depth + 1, nested);
+            record_array_member_facts_to_acc_id(acc, path_base, depth + 1, nested);
         }
     }
 }
